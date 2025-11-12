@@ -56,25 +56,35 @@ This project uses the **src layout**, which provides better isolation between so
 
 ## Examples
 
-### CIFAR-10 Sparse Labeling Example
+### CIFAR-10 Sparse Pixel Example
 
-A minimal example demonstrating sparse labeling with CNNs on CIFAR-10:
+A realistic example demonstrating **image-to-image learning with sparse pixel supervision**:
 
 ```bash
+# Make sure you're in the fl4hma environment
+conda activate fl4hma
+
 # Install with example dependencies
 pip install -e .[examples]
 
-# Run the example
+# Run the Python example
 python run_sparse_example.py
+
+# Or run the interactive Jupyter notebook
+jupyter notebook examples/cifar10_sparse_demo.ipynb
 ```
 
 This example shows:
-- Loading CIFAR-10 with artificial sparse labeling (10% labeled data)
-- Training a vanilla CNN with sparse supervision
-- Visualizing labeled vs unlabeled samples
-- Evaluating model performance
+- **Sparse input pixels**: Images with missing/masked pixels (simulating clouds, sensor failures)
+- **Sparse output labels**: Only some pixels have target values (simulating limited ground truth)
+- **U-Net CNN architecture**: For pixel-to-pixel prediction and reconstruction
+- **Realistic federated learning scenario**: Different clients with varying data availability
 
-Perfect for demonstrating federated learning scenarios where different clients have different amounts of labeled data.
+**Perfect for applications like:**
+- Satellite imagery with cloud cover
+- Climate data with sparse measurements  
+- Remote sensing with incomplete observations
+- Federated learning with heterogeneous data quality
 
 ## Usage
 

@@ -29,12 +29,12 @@ To add optional dependencies, follow the below instructions instead.
 
 For running examples:
 ```bash
-pip install -e .[examples]  # Adds torch, torchvision, matplotlib
+pip install -e ".[examples]"  # Adds torch, torchvision, matplotlib
 ```
 
 For development tools:
 ```bash
-pip install -e .[dev]       # Adds pytest, black, flake8
+pip install -e ".[dev]"       # Adds pytest, black, flake8
 ```
 
 ## Structure

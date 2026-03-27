@@ -30,6 +30,13 @@ examples = [
     "torchvision>=0.13.0", 
     "matplotlib>=3.5.0",
 ]
+federated = [
+    "torch>=1.12.0",
+    "torchvision>=0.13.0",
+    "matplotlib>=3.5.0",
+    "flwr[simulation]>=1.5",
+    "scikit-learn",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

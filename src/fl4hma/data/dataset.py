@@ -19,22 +19,21 @@ class StationPatchDataset(Dataset):
         normalize: bool = True,
         dtype: torch.dtype = torch.float32,
         input_sparsity: float = None,
-        output_sparsity: float = 0.1, 
+        output_sparsity: float = None, 
         transform=None,
     ):
         """
-        Parameters
-        ----------
-        dataarray : xr.DataArray
-            Shape: (time, lat, lon)
-        patch_size : int
-            Spatial patch size (default 32)
-        stride : int
-            Sliding window stride (default 32, non-overlapping)
-        normalize : bool
-            Whether to normalize data (mean/std over full array)
-        dtype : torch.dtype
-            Torch dtype
+        Create the dataset patches
+
+        Args:
+            dataarray (xr.DataArray): data of dimension (variable, time, lat, lon)
+            patch_size (int, optional): Spatial patch size (default 32)
+            stride (int, optional): Sliding window stride (default 32, non-overlapping)
+            normalize (bool, optional): Whether to normalize data (mean/std over full array)
+            dtype (torch.dtype, optional): Torch dtype
+            input_sparsity (float, optional): Fraction of input pixels to keep (default None). If None, uses station mask.
+            output_sparsity (float, optional): Fraction of output pixels to keep (default None). If None, uses output mask.
+            transform (_type_, optional): Optional transform to be applied on a sample. Defaults to None.
         """
 
         assert set(dataarray.dims) == {"variable", "time", "lat", "lon"}, \
@@ -63,10 +62,13 @@ class StationPatchDataset(Dataset):
                     self.indices.append((t, i, j))
 
         if input_sparsity is None:
-            self.station_mask = np.load("station_data/hma_station_mask.npy") # shape (lat, lon)
+            self.station_mask = np.load("station_data/masks/centralised_mask.npy") # shape (lat, lon)
         else:
             self.input_sparsity = input_sparsity
-        self.output_sparsity = output_sparsity
+        if output_sparsity is None:
+            self.output_mask = np.load("station_data/masks/out_mask.npy") # shape (lat, lon)
+        else:
+            self.output_sparsity = output_sparsity
 
     def __len__(self):
         return len(self.indices)
@@ -94,8 +96,13 @@ class StationPatchDataset(Dataset):
                                  j : j + self.patch_size]
             input_mask = torch.tensor(input_mask, dtype=torch.bool)
         
-        # Output mask: which pixels have target labels  
-        output_mask = torch.rand(patch.shape[-2], patch.shape[-1]) < self.output_sparsity
+        # Output mask: which pixels have target labels
+        if hasattr(self, "output_sparsity"):
+            output_mask = torch.rand(patch.shape[-2], patch.shape[-1]) < self.output_sparsity
+        else:
+            output_mask = self.output_mask[i : i + self.patch_size,
+                                 j : j + self.patch_size]
+            output_mask = torch.tensor(output_mask, dtype=torch.bool)
         
         # Create sparse input (mask out some pixels)
         sparse_input = patch.clone()

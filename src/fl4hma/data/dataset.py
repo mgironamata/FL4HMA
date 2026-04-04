@@ -18,8 +18,8 @@ class StationPatchDataset(Dataset):
         stride: int = 32,
         normalize: bool = True,
         dtype: torch.dtype = torch.float32,
-        input_sparsity: float = None,
-        output_sparsity: float = None, 
+        input_sparsity: float | str | None = None,
+        output_sparsity: float | None = None, 
         transform=None,
     ):
         """
@@ -61,10 +61,15 @@ class StationPatchDataset(Dataset):
                 for j in range(0, self.lon_len - patch_size + 1, stride):
                     self.indices.append((t, i, j))
 
+        # Input masking strategy
         if input_sparsity is None:
             self.station_mask = np.load("station_data/masks/centralised_mask.npy") # shape (lat, lon)
+        elif isinstance(input_sparsity, str):
+            self.station_mask = np.load(input_sparsity) # shape (lat, lon)
         else:
             self.input_sparsity = input_sparsity
+
+        # Output masking strategy
         if output_sparsity is None:
             self.output_mask = np.load("station_data/masks/out_mask.npy") # shape (lat, lon)
         else:

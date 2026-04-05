@@ -24,6 +24,8 @@ dev = [
     "pytest",
     "black",
     "flake8",
+    "isort",
+    "pre-commit",
 ]
 examples = [
     "torch>=1.12.0",
@@ -34,3 +36,6 @@ examples = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["fl4hma*"]
+
+[tool.isort]
+profile = "black"

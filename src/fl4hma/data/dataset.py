@@ -32,7 +32,7 @@ class StationPatchDataset(Dataset):
             normalize (bool, optional): Whether to normalize data (mean/std over full array)
             dtype (torch.dtype, optional): Torch dtype
             input_sparsity (float | str | None, optional): Fraction of input pixels to keep (default None).
-                If None, uses station mask. If a string, loads the mask from the given file path.
+                If None, uses centralised stationary station mask. If a string, loads the mask from the given file path.
             output_sparsity (float | None, optional): Fraction of output pixels to keep (default None).
                 If None, uses output mask.
             transform (_type_, optional): Optional transform to be applied on a sample. Defaults to None.
@@ -72,7 +72,7 @@ class StationPatchDataset(Dataset):
         # Input masking strategy
         if input_sparsity is None:
             self.station_mask = np.load(
-                "station_data/masks/centralised_mask.npy"
+                "station_data/masks/stat/centralised_mask.npy"
             )  # shape (lat, lon)
         elif isinstance(input_sparsity, str):
             self.station_mask = np.load(input_sparsity)  # shape (lat, lon)

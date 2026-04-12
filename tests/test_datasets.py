@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 import xarray as xr
@@ -15,7 +16,7 @@ def make_dataarray(n_vars=3, n_time=4, n_lat=64, n_lon=64):
         dims=("variable", "time", "lat", "lon"),
         coords={
             "variable": [f"v{i}" for i in range(n_vars)],
-            "time": np.arange(n_time),
+            "time": pd.to_datetime(np.arange(n_time), unit="D", origin="1998-01-01"),
             "lat": np.linspace(25, 40, n_lat),
             "lon": np.linspace(60, 105, n_lon),
         },
@@ -235,6 +236,21 @@ class TestMasking:
         _, _, input_mask, output_mask = ds[0]
         assert input_mask.sum() == 0
         assert output_mask.sum() == 0
+
+    def test_nonstationary_mask_slicing(self, tmp_path):
+        """Assumes the mask starts in 1998 and the dataset sits with the masked period."""
+        # Create a yearly mask with shape (year, lat, lon)
+        yearly_mask = np.random.default_rng(0).random((5, 64, 64)) > 0.5
+        mask_path = tmp_path / "yearly_mask.npy"
+        np.save(mask_path, yearly_mask)
+        ds = StationPatchDataset(
+            make_dataarray(n_time=365 * 3, n_lat=64, n_lon=64),
+            input_sparsity=str(mask_path),
+            output_sparsity=0.5,
+        )
+        # The dataset should slice the yearly mask to the first 3 years and convert it
+        # to a daily resolution with one leap day
+        assert ds.station_mask.shape == (365 * 3 + 1, 64, 64)
 
 
 # ── reproducibility ──────────────────────────────────────────────────────────

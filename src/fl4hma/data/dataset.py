@@ -76,6 +76,9 @@ class StationPatchDataset(Dataset):
             )  # shape (lat, lon)
         elif isinstance(input_sparsity, str):
             self.station_mask = np.load(input_sparsity)  # shape (lat, lon)
+            # If non-stationary, transform year-based mask to daily mask
+            if self.station_mask.ndim > 2:
+                self.station_mask = self.generate_daily_mask(self.station_mask)
         else:
             self.input_sparsity = input_sparsity
 
@@ -162,3 +165,36 @@ class StationPatchDataset(Dataset):
             mask = torch.tensor(mask, dtype=torch.bool)
 
         return mask
+
+    def generate_daily_mask(self, yearly_mask: np.ndarray) -> np.ndarray:
+        """
+        Slices a yearly mask to the dataset period and then coverts the mask
+        of shape (year, lat, lon) to a daily mask of shape (time, lat, lon) by
+        repeating each year's mask for the corresponding days and taking into
+        account leap years.
+
+        Args:
+            yearly_mask (np.ndarray): The input yearly mask of shape (year, lat, lon).
+
+        Returns:
+            np.ndarray: The output daily mask of shape (time, lat, lon).
+        """
+
+        # We assume the mask start the same year
+        n = 1998
+        start_year = self.da.time.dt.year.min().item()
+        end_year = self.da.time.dt.year.max().item()
+        yearly_mask = yearly_mask[start_year - n : end_year - n + 1]
+
+        daily_mask = []
+        for year in range(start_year, end_year + 1):
+            year_mask = yearly_mask[year - start_year]  # shape (lat, lon)
+            days_in_year = (
+                366 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 365
+            )
+            daily_mask.append(
+                np.repeat(year_mask[np.newaxis, :, :], days_in_year, axis=0)
+            )
+
+        daily_mask = np.concatenate(daily_mask, axis=0)
+        return daily_mask

@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+
+/station_data/masks/
+/station_data/masks_precip/
+/station_data/masks_tave/
+
+/examples/data/
+/data/cifar-10-batches-py/
+/data/cifar_10_python.tar.gz

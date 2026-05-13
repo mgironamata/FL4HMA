@@ -1,6 +1,5 @@
 import json
 import os
-import urllib.request
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
@@ -143,7 +142,7 @@ def generate_random_split_masks(
 
 
 # ---------------------------------------------------------------------------
-# Country name → Natural Earth "name" field mapping
+# Country name → geoBoundaries "shapeName" field mapping
 # ---------------------------------------------------------------------------
 _COUNTRY_NAME_MAP = {
     "afghanistan": "Afghanistan",
@@ -157,22 +156,7 @@ _COUNTRY_NAME_MAP = {
     "uzbekistan": "Uzbekistan",
 }
 
-_NE_GEOJSON_URL = (
-    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
-    "master/geojson/ne_50m_admin_0_countries.geojson"
-)
-
-
-def _download_natural_earth(cache_path: str) -> dict:
-    """Download Natural Earth 50m countries GeoJSON (cached on disk)."""
-    if os.path.exists(cache_path):
-        with open(cache_path) as f:
-            return json.load(f)
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    print(f"  Downloading Natural Earth GeoJSON → {cache_path}")
-    urllib.request.urlretrieve(_NE_GEOJSON_URL, cache_path)
-    with open(cache_path) as f:
-        return json.load(f)
+_GEOBOUNDARIES_GEOJSON = "data/country_masks/geoBoundariesCGAZ_ADM0.geojson"
 
 
 def _polygon_coords_to_paths(geometry: dict) -> List[Path]:
@@ -192,12 +176,12 @@ def generate_country_boundary_masks(
     countries: List[str],
     out_dir: str,
     land_mask: Optional[np.ndarray] = None,
-    geojson_cache: str = "data/ne_50m_admin_0_countries.geojson",
+    geojson_path: str = _GEOBOUNDARIES_GEOJSON,
     name_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """Rasterise country polygons onto a lat/lon grid.
 
-    Uses Natural Earth 50m boundaries (downloaded once and cached).
+    Uses geoBoundaries CGAZ ADM0 boundaries (local GeoJSON).
     Point-in-polygon is done via ``matplotlib.path.Path``.
 
     Parameters
@@ -206,8 +190,9 @@ def generate_country_boundary_masks(
     countries : list of lowercase country names (keys in *name_map*).
     out_dir : directory where ``<country>_boundary_mask.npy`` is saved.
     land_mask : optional 2-D array; boundary masks are intersected with it.
-    geojson_cache : path to cache the downloaded GeoJSON file.
-    name_map : {lowercase_name: Natural_Earth_name}. Defaults to HMA set.
+    geojson_path : path to the geoBoundaries GeoJSON file.
+                   Defaults to ``data/country_masks/geoBoundariesCGAZ_ADM0.geojson``.
+    name_map : {lowercase_name: shapeName}. Defaults to HMA set.
 
     Returns
     -------
@@ -218,13 +203,14 @@ def generate_country_boundary_masks(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # Download / load Natural Earth
-    geojson = _download_natural_earth(geojson_cache)
+    # Load local geoBoundaries GeoJSON
+    with open(geojson_path) as f:
+        geojson = json.load(f)
 
-    # Build lookup: NE name → geometry
+    # Build lookup: shapeName → geometry
     ne_geom = {}
     for feat in geojson["features"]:
-        ne_geom[feat["properties"]["NAME"]] = feat["geometry"]
+        ne_geom[feat["properties"]["shapeName"]] = feat["geometry"]
 
     # Build grid points (lon, lat) — shape (N, 2) for Path.contains_points
     lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
@@ -241,7 +227,7 @@ def generate_country_boundary_masks(
         ne_name = name_map[country]
         if ne_name not in ne_geom:
             raise ValueError(
-                f"Country '{ne_name}' not found in Natural Earth data. "
+                f"Country '{ne_name}' not found in geoBoundaries data. "
                 f"Available: {sorted(ne_geom.keys())}"
             )
 

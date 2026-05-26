@@ -4,15 +4,15 @@ Simple runner for the CIFAR-10 sparse pixel example.
 Run this script to demonstrate sparse pixel image-to-image learning.
 """
 
-import sys
 import os
+import sys
 
 # Add the src directory to Python path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 try:
     from examples.sparse_pixel_example import main
-    
+
     if __name__ == "__main__":
         print("Running CIFAR-10 sparse pixel image-to-image example...")
         print("Note: This requires PyTorch. Install with:")
@@ -24,9 +24,9 @@ try:
         print("• Realistic federated learning scenarios")
         print("• Sparse input pixels (missing data) + sparse output labels")
         print()
-        
+
         main()
-        
+
 except ImportError as e:
     print(f"ImportError: {e}")
     print()

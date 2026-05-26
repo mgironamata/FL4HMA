@@ -23,7 +23,7 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 class SparsePixelDataset(Dataset):
@@ -415,7 +415,7 @@ def main():
         test_batch = next(iter(test_loader))
         sparse_input, sparse_target, input_mask, output_mask = test_batch
         sparse_input = sparse_input.to(device)
-        
+        sparse_target = sparse_target.to(device)
         predictions = model(sparse_input)
         
         # Visualize results
@@ -431,13 +431,6 @@ def main():
     
     print("\n" + "=" * 60)
     print("Training completed successfully!")
-    print("This model demonstrates sparse pixel supervision relevant for:")
-    print("  • Satellite imagery with cloud cover")
-    print("  • Climate data with sparse measurements") 
-    print("  • Remote sensing applications")
-    print("  • Federated learning with heterogeneous data availability")
-    print("=" * 60)
-
 
 if __name__ == "__main__":
     main()

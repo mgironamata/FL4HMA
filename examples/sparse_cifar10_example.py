@@ -18,6 +18,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Tuple
 from torch.utils.data import DataLoader, Dataset
 
 

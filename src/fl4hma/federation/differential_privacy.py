@@ -117,17 +117,21 @@ class DPAccountant:
                 rdp[i] = alpha / (2.0 * noise_multiplier**2)
             else:
                 # Subsampled Gaussian (Poisson subsampling upper bound)
-                rdp[i] = (
-                    math.log1p(
-                        sample_rate**2
-                        * (math.exp(alpha / (noise_multiplier**2)) - 1)
-                        / (alpha - 1)
+                # Use the tighter bound as a fallback for large alpha where
+                # exp(alpha/sigma^2) overflows.
+                full_batch_rdp = alpha / (2.0 * noise_multiplier**2)
+                exponent = alpha / (noise_multiplier**2)
+                if alpha <= 1:
+                    rdp[i] = 0.0
+                elif exponent > 500:
+                    # exp() would overflow; the subsampled bound can only be
+                    # worse than the full-batch bound, so use full-batch.
+                    rdp[i] = full_batch_rdp
+                else:
+                    subsampled = math.log1p(
+                        sample_rate**2 * (math.exp(exponent) - 1) / (alpha - 1)
                     )
-                    if alpha > 1
-                    else 0.0
-                )
-                # Tighter bound for large alpha
-                rdp[i] = min(rdp[i], alpha / (2.0 * noise_multiplier**2))
+                    rdp[i] = min(subsampled, full_batch_rdp)
         return rdp
 
     def step(self, noise_multiplier: float, sample_rate: float = 1.0) -> None:
@@ -289,15 +293,38 @@ def add_noise_to_parameters(
     parameters: List[np.ndarray],
     noise_std: float,
     rng: Optional[np.random.Generator] = None,
+    noise_mask: Optional[List[bool]] = None,
 ) -> List[np.ndarray]:
-    """Add Gaussian noise to model parameters."""
+    """Add Gaussian noise to model parameters.
+
+    Parameters
+    ----------
+    parameters : list of ndarray
+        Model parameters (state dict values).
+    noise_std : float
+        Standard deviation of Gaussian noise.
+    rng : numpy Generator or None
+        Random number generator.
+    noise_mask : list of bool or None
+        If given, only add noise where True. This is used to skip
+        non-trainable buffers (e.g. BatchNorm running stats).
+    """
     if rng is None:
         rng = np.random.default_rng()
     noisy = []
-    for p in parameters:
-        noise = rng.normal(loc=0.0, scale=noise_std, size=p.shape).astype(p.dtype)
-        noisy.append(p + noise)
+    for i, p in enumerate(parameters):
+        if noise_mask is not None and not noise_mask[i]:
+            noisy.append(p.copy())
+        else:
+            noise = rng.normal(loc=0.0, scale=noise_std, size=p.shape).astype(p.dtype)
+            noisy.append(p + noise)
     return noisy
+
+
+def _get_trainable_mask(model: nn.Module) -> List[bool]:
+    """Return a boolean mask over state_dict entries: True for trainable params."""
+    param_names = {name for name, _ in model.named_parameters()}
+    return [name in param_names for name in model.state_dict().keys()]
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +420,8 @@ class DPFedAvg(FedAvg):
         self,
         dp_config: DPConfig,
         num_clients: int,
+        in_channels: int = 3,
+        base_filters: int = 32,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -402,6 +431,11 @@ class DPFedAvg(FedAvg):
         self._rng = np.random.default_rng(42)
         # Cache the pre-round global params for computing deltas
         self._global_params: Optional[List[np.ndarray]] = None
+        # Mask: True for trainable params, False for buffers (e.g. BN stats)
+        _ref_model = UNetCNN(
+            in_channels=in_channels, out_channels=1, base_filters=base_filters
+        )
+        self._trainable_mask = _get_trainable_mask(_ref_model)
 
     def aggregate_fit(
         self,
@@ -439,14 +473,19 @@ class DPFedAvg(FedAvg):
         )
 
         if aggregated_params is not None:
-            # Add noise to aggregated parameters
+            # Add noise only to trainable parameters (skip BN running stats)
             agg_ndarrays = fl.common.parameters_to_ndarrays(aggregated_params)
             noise_std = (
                 self.dp_config.noise_multiplier
                 * self.dp_config.clip_norm
                 / self.num_clients
             )
-            noisy_params = add_noise_to_parameters(agg_ndarrays, noise_std, self._rng)
+            noisy_params = add_noise_to_parameters(
+                agg_ndarrays,
+                noise_std,
+                self._rng,
+                noise_mask=self._trainable_mask,
+            )
             aggregated_params = fl.common.ndarrays_to_parameters(noisy_params)
 
             # Update cached global params
@@ -614,6 +653,8 @@ def run_federated_dp(
     strategy = DPFedAvg(
         dp_config=dp_config,
         num_clients=num_clients,
+        in_channels=in_channels,
+        base_filters=base_filters,
         fraction_fit=1.0,
         fraction_evaluate=0.0,
         min_fit_clients=num_clients,

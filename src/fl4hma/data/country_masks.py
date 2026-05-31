@@ -1,16 +1,24 @@
-""" TO DO: switch to Natural Earth boundaries and disputed areas
+"""Country boundary mask generation.
 
-Boundary mask generation"""
+Supports two boundary sources:
+- geoBoundaries CGAZ ADM0 GeoJSON (legacy)
+- Natural Earth 10m with disputed areas merged by de-facto administrator
+"""
 
 import json
 import os
-from typing import Dict, List, Optional
+from pathlib import Path as _Path
+from typing import Dict, List, Optional, Union
 
+import geopandas as gpd
 import numpy as np
 from matplotlib.path import Path
+from shapely import vectorized
+from shapely.geometry import box
+from shapely.ops import unary_union
 
 # ---------------------------------------------------------------------------
-# Country name → geoBoundaries "shapeName" field mapping
+# Country name → geoBoundaries "shapeName" field mapping (legacy)
 # ---------------------------------------------------------------------------
 COUNTRY_NAME_MAP = {
     "afghanistan": "Afghanistan",
@@ -25,6 +33,29 @@ COUNTRY_NAME_MAP = {
 }
 
 _GEOBOUNDARIES_GEOJSON = "data/country_masks/geoBoundariesCGAZ_ADM0.geojson"
+
+# ---------------------------------------------------------------------------
+# Natural Earth ADM0_A3 → lowercase country key
+# ---------------------------------------------------------------------------
+_ADM0_A3_TO_COUNTRY: Dict[str, str] = {
+    "AFG": "afghanistan",
+    "CHN": "china",
+    "IND": "india",
+    "KAZ": "kazakhstan",
+    "KGZ": "kyrgyzstan",
+    "NPL": "nepal",
+    "PAK": "pakistan",
+    "TJK": "tajikistan",
+    "UZB": "uzbekistan",
+    "KAS": "india",  # Siachen Glacier – de-facto Indian administration
+}
+
+_NE_COUNTRIES_SHP = (
+    "data/country_masks/ne_10m_admin_0_countries/ne_10m_admin_0_countries.shp"
+)
+_NE_DISPUTED_SHP = (
+    "data/country_masks/ne_10m_admin_0_disputed_areas/ne_10m_admin_0_disputed_areas.shp"
+)
 
 
 def generate_random_split_masks(
@@ -88,7 +119,7 @@ def _polygon_coords_to_paths(geometry: dict) -> List[Path]:
     return paths
 
 
-def generate_country_boundary_masks(
+def generate_geo_country_boundary_masks(
     lat_vals: np.ndarray,
     lon_vals: np.ndarray,
     countries: List[str],
@@ -156,6 +187,158 @@ def generate_country_boundary_masks(
         for p in paths:
             inside |= p.contains_points(grid_points)
         mask = inside.reshape(lon_grid.shape).astype(int)
+
+        if land_mask is not None:
+            mask = mask & land_mask.astype(int)
+
+        np.save(path_file, mask)
+        print(f"    {country:15s}: {int(mask.sum()):5d} pixels")
+        mask_paths[country] = path_file
+
+    return mask_paths
+
+
+# ---------------------------------------------------------------------------
+# Natural Earth boundaries with disputed areas
+# ---------------------------------------------------------------------------
+
+
+def load_natural_earth_boundaries(
+    countries_shp: str = _NE_COUNTRIES_SHP,
+    disputed_shp: str = _NE_DISPUTED_SHP,
+    adm0_a3_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, gpd.GeoDataFrame]:
+    """Load Natural Earth countries and merge disputed areas by de-facto admin.
+
+    Disputed areas are assigned to the country that administers them
+    according to the ``ADM0_A3`` field.  The mapping from ADM0_A3 codes
+    to lowercase country keys is given by *adm0_a3_map* (defaults to
+    ``_ADM0_A3_TO_COUNTRY``).
+
+    Parameters
+    ----------
+    countries_shp : path to ne_10m_admin_0_countries shapefile.
+    disputed_shp : path to ne_10m_admin_0_disputed_areas shapefile.
+    adm0_a3_map : {ADM0_A3_code: country_key}. Defaults to HMA set.
+
+    Returns
+    -------
+    Dict mapping lowercase country key → GeoDataFrame with merged geometry.
+    """
+    if adm0_a3_map is None:
+        adm0_a3_map = _ADM0_A3_TO_COUNTRY
+
+    gdf_countries = gpd.read_file(countries_shp)
+    gdf_disputed = gpd.read_file(disputed_shp)
+
+    # Build {country_key: [geometry, ...]} collecting base + disputed polygons
+    geom_parts: Dict[str, list] = {}
+    for country_key in adm0_a3_map.values():
+        geom_parts.setdefault(country_key, [])
+
+    # Add base country geometries (matched by NAME)
+    name_to_key = {v: k for k, v in COUNTRY_NAME_MAP.items()}
+    for _, row in gdf_countries.iterrows():
+        key = name_to_key.get(row["NAME"])
+        if key is not None:
+            geom_parts.setdefault(key, []).append(row.geometry)
+
+    # Add disputed areas by ADM0_A3
+    for _, row in gdf_disputed.iterrows():
+        a3 = row["ADM0_A3"]
+        key = adm0_a3_map.get(a3)
+        if key is not None:
+            geom_parts[key].append(row.geometry)
+
+    # Merge into unified geometries
+    result: Dict[str, gpd.GeoDataFrame] = {}
+    for key, geoms in geom_parts.items():
+        if geoms:
+            merged = unary_union(geoms)
+            result[key] = gpd.GeoDataFrame(
+                {"country": [key]}, geometry=[merged], crs=gdf_countries.crs
+            )
+
+    return result
+
+
+def _rasterize_geometry(
+    geometry,
+    lat_vals: np.ndarray,
+    lon_vals: np.ndarray,
+) -> np.ndarray:
+    """Rasterize a shapely geometry onto a regular lat/lon grid.
+
+    Uses ``shapely.vectorized.contains`` for fast point-in-polygon.
+
+    Returns
+    -------
+    2-D bool array of shape (len(lat_vals), len(lon_vals)).
+    """
+    lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
+    return vectorized.contains(geometry, lon_grid, lat_grid)
+
+
+def generate_country_boundary_masks(
+    lat_vals: np.ndarray,
+    lon_vals: np.ndarray,
+    countries: List[str],
+    out_dir: str,
+    land_mask: Optional[np.ndarray] = None,
+    countries_shp: str = _NE_COUNTRIES_SHP,
+    disputed_shp: str = _NE_DISPUTED_SHP,
+    adm0_a3_map: Optional[Dict[str, str]] = None,
+    force: bool = False,
+) -> Dict[str, str]:
+    """Rasterise Natural Earth country polygons (with disputed areas) onto a grid.
+
+    Disputed areas are merged into the country that administers them
+    de-facto, based on the ``ADM0_A3`` field in the NE disputed-areas
+    shapefile.
+
+    Parameters
+    ----------
+    lat_vals, lon_vals : 1-D arrays of grid coordinates.
+    countries : list of lowercase country keys to generate masks for.
+    out_dir : directory where ``<country>_boundary_mask.npy`` is saved.
+    land_mask : optional 2-D array; boundary masks are intersected with it.
+    countries_shp : path to ne_10m_admin_0_countries shapefile.
+    disputed_shp : path to ne_10m_admin_0_disputed_areas shapefile.
+    adm0_a3_map : {ADM0_A3_code: country_key}. Defaults to HMA set.
+    force : regenerate masks even if cached files exist.
+
+    Returns
+    -------
+    {country_key: path_to_boundary_mask.npy}
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load and merge boundaries
+    merged = load_natural_earth_boundaries(
+        countries_shp=countries_shp,
+        disputed_shp=disputed_shp,
+        adm0_a3_map=adm0_a3_map,
+    )
+
+    mask_paths: Dict[str, str] = {}
+    for country in countries:
+        path_file = os.path.join(out_dir, f"{country}_boundary_mask.npy")
+
+        if not force and os.path.exists(path_file):
+            print(
+                f"    {country:15s}: cached ({int(np.load(path_file).sum()):5d} pixels)"
+            )
+            mask_paths[country] = path_file
+            continue
+
+        if country not in merged:
+            raise ValueError(
+                f"Country '{country}' not found in Natural Earth data. "
+                f"Available: {sorted(merged.keys())}"
+            )
+
+        geom = merged[country].geometry.iloc[0]
+        mask = _rasterize_geometry(geom, lat_vals, lon_vals).astype(int)
 
         if land_mask is not None:
             mask = mask & land_mask.astype(int)

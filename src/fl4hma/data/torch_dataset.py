@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -167,3 +167,23 @@ class StationPatchDataset(Dataset):
             )
 
         return np.concatenate(daily_mask, axis=0)
+
+
+def build_country_datasets(
+    da: xr.DataArray,
+    country_masks: Dict[str, str],
+    output_mask_path: str,
+    patch_size: int = 32,
+    stride: int = 32,
+) -> Dict[str, StationPatchDataset]:
+    """Create one ``StationPatchDataset`` per country."""
+    datasets = {}
+    for country, mask_path in country_masks.items():
+        datasets[country] = StationPatchDataset(
+            dataarray=da,
+            input_mask_path=mask_path,
+            output_mask_path=output_mask_path,
+            patch_size=patch_size,
+            stride=stride,
+        )
+    return datasets

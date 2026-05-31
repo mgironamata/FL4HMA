@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from fl4hma.data.create import create_data_array
+from fl4hma.data.data_loading import create_data_array
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 

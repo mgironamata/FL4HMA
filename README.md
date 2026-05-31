@@ -1,6 +1,6 @@
 # Federated learning for High Mountain Asia (FL4HMA)
 
-Federated learning experiment to recreate APHRODITE precipitation and temperature fields over High Mountain Asia. The package allows user to train a infilling model from stations locations in centralised and federated learning frameworks.
+Federated learning experiments to recreate APHRODITE precipitation and temperature fields over High Mountain Asia. The package allows user to train a infilling model from stations locations in centralised and federated learning frameworks.
 
 The federated model configurations include:
 * randomised station mask

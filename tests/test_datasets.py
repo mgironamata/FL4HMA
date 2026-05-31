@@ -4,7 +4,7 @@ import pytest
 import torch
 import xarray as xr
 
-from fl4hma.data.dataset import StationPatchDataset
+from fl4hma.data.torch_dataset import StationPatchDataset
 
 
 def make_dataarray(n_vars=3, n_time=4, n_lat=64, n_lon=64):
@@ -32,6 +32,12 @@ class TestInit:
         with pytest.raises(AssertionError, match="must have dims"):
             StationPatchDataset(bad, input_sparsity=0.5, output_sparsity=0.5)
 
+    def test_missing_mask_and_sparsity_raises(self):
+        with pytest.raises(ValueError, match="input_mask_path or input_sparsity"):
+            StationPatchDataset(make_dataarray(), output_sparsity=0.5)
+        with pytest.raises(ValueError, match="output_mask_path or output_sparsity"):
+            StationPatchDataset(make_dataarray(), input_sparsity=0.5)
+
     def test_stores_patch_size_and_stride(self):
         ds = StationPatchDataset(
             make_dataarray(),
@@ -58,7 +64,7 @@ class TestInit:
         np.save(mask_path, mask)
         ds = StationPatchDataset(
             make_dataarray(),
-            input_sparsity=str(mask_path),
+            input_mask_path=str(mask_path),
             output_sparsity=0.5,
         )
         np.testing.assert_array_equal(ds.station_mask, mask)
@@ -245,7 +251,7 @@ class TestMasking:
         np.save(mask_path, yearly_mask)
         ds = StationPatchDataset(
             make_dataarray(n_time=365 * 3, n_lat=64, n_lon=64),
-            input_sparsity=str(mask_path),
+            input_mask_path=str(mask_path),
             output_sparsity=0.5,
         )
         # The dataset should slice the yearly mask to the first 3 years and convert it
@@ -264,7 +270,7 @@ class TestReproducibility:
         np.save(mask_path, mask)
         ds = StationPatchDataset(
             make_dataarray(n_time=2, n_lat=64, n_lon=64),
-            input_sparsity=str(mask_path),
+            input_mask_path=str(mask_path),
             output_sparsity=0.5,
         )
         _, _, m1, _ = ds[0]

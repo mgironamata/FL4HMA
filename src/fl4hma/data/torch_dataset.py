@@ -1,15 +1,15 @@
 from typing import Optional
 
-import torch
-from torch.utils.data import Dataset
-import xarray as xr
 import numpy as np
+import torch
+import xarray as xr
+from torch.utils.data import Dataset
 
 
 class StationPatchDataset(Dataset):
     """
     PyTorch Dataset that extracts spatial patches from an xarray DataArray
-    and applies station-based masking.
+    and applies station-based or random masking.
 
     Parameters
     ----------
@@ -17,6 +17,7 @@ class StationPatchDataset(Dataset):
         Shape (variable, time, lat, lon).
     input_mask_path : str or None
         Path to a ``.npy`` binary mask for input masking.
+        Supports 2D (lat, lon) or 3D (year, lat, lon) masks.
         If None, ``input_sparsity`` is used (random mask).
     output_mask_path : str or None
         Path to a ``.npy`` binary mask for output masking.
@@ -28,6 +29,8 @@ class StationPatchDataset(Dataset):
     patch_size : int
     stride : int
     normalize : bool
+    mask_start_year : int
+        The first year covered by a 3D yearly mask (default 1998).
     """
 
     def __init__(
@@ -41,13 +44,20 @@ class StationPatchDataset(Dataset):
         stride: int = 32,
         normalize: bool = True,
         dtype: torch.dtype = torch.float32,
+        mask_start_year: int = 1998,
     ):
-        assert set(dataarray.dims) == {"variable", "time", "lat", "lon"}, \
-            "DataArray must have dims ('variable', 'time', 'lat', 'lon')"
+        assert set(dataarray.dims) == {
+            "variable",
+            "time",
+            "lat",
+            "lon",
+        }, "DataArray must have dims ('variable', 'time', 'lat', 'lon')"
 
+        self.da = dataarray
         self.patch_size = patch_size
         self.stride = stride
         self.dtype = dtype
+        self.mask_start_year = mask_start_year
 
         # Convert to numpy
         self.data = dataarray.values.astype(np.float32)
@@ -68,17 +78,19 @@ class StationPatchDataset(Dataset):
 
         # Input mask
         if input_mask_path is not None:
-            self._station_mask = np.load(input_mask_path)
+            self.station_mask = np.load(input_mask_path)
+            if self.station_mask.ndim > 2:
+                self.station_mask = self._expand_yearly_to_daily(self.station_mask)
         elif input_sparsity is not None:
-            self._input_sparsity = input_sparsity
+            self.input_sparsity = input_sparsity
         else:
             raise ValueError("Provide input_mask_path or input_sparsity")
 
         # Output mask
         if output_mask_path is not None:
-            self._output_mask = np.load(output_mask_path)
+            self.output_mask = np.load(output_mask_path)
         elif output_sparsity is not None:
-            self._output_sparsity = output_sparsity
+            self.output_sparsity = output_sparsity
         else:
             raise ValueError("Provide output_mask_path or output_sparsity")
 
@@ -86,29 +98,42 @@ class StationPatchDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
+        if idx >= len(self.indices) or idx < -len(self.indices):
+            raise IndexError(
+                f"index {idx} out of range for dataset of length {len(self)}"
+            )
+
         t, i, j = self.indices[idx]
         ps = self.patch_size
 
-        patch = self.data[:, t, i:i + ps, j:j + ps]
+        patch = self.data[:, t, i : i + ps, j : j + ps]
         patch = torch.tensor(patch, dtype=self.dtype)
 
         np.random.seed(idx)
 
         # Input mask
-        if hasattr(self, "_station_mask"):
-            input_mask = torch.tensor(
-                self._station_mask[i:i + ps, j:j + ps], dtype=torch.bool,
-            )
+        if hasattr(self, "station_mask"):
+            if self.station_mask.ndim == 2:
+                input_mask = torch.tensor(
+                    self.station_mask[i : i + ps, j : j + ps],
+                    dtype=torch.bool,
+                )
+            else:
+                input_mask = torch.tensor(
+                    self.station_mask[t, i : i + ps, j : j + ps],
+                    dtype=torch.bool,
+                )
         else:
-            input_mask = torch.rand(ps, ps) < self._input_sparsity
+            input_mask = torch.rand(ps, ps) < self.input_sparsity
 
         # Output mask
-        if hasattr(self, "_output_mask"):
+        if hasattr(self, "output_mask"):
             output_mask = torch.tensor(
-                self._output_mask[i:i + ps, j:j + ps], dtype=torch.bool,
+                self.output_mask[i : i + ps, j : j + ps],
+                dtype=torch.bool,
             )
         else:
-            output_mask = torch.rand(ps, ps) < self._output_sparsity
+            output_mask = torch.rand(ps, ps) < self.output_sparsity
 
         # Apply input mask (zero out missing pixels in channel 0)
         sparse_input = patch.clone()
@@ -119,3 +144,26 @@ class StationPatchDataset(Dataset):
         sparse_target[0, ~output_mask] = -1.0
 
         return sparse_input, sparse_target, input_mask.float(), output_mask.float()
+
+    def _expand_yearly_to_daily(self, yearly_mask: np.ndarray) -> np.ndarray:
+        """
+        Expand a yearly mask (year, lat, lon) to daily resolution (time, lat, lon),
+        sliced to the dataset's time period and accounting for leap years.
+        """
+        start_year = self.da.time.dt.year.min().item()
+        end_year = self.da.time.dt.year.max().item()
+        yearly_mask = yearly_mask[
+            start_year - self.mask_start_year : end_year - self.mask_start_year + 1
+        ]
+
+        daily_mask = []
+        for year in range(start_year, end_year + 1):
+            year_mask = yearly_mask[year - start_year]
+            days_in_year = (
+                366 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 365
+            )
+            daily_mask.append(
+                np.repeat(year_mask[np.newaxis, :, :], days_in_year, axis=0)
+            )
+
+        return np.concatenate(daily_mask, axis=0)

@@ -4,7 +4,7 @@ Federated learning experiments to recreate APHRODITE precipitation and temperatu
 
 The federated model configurations include:
 * randomised station mask
-* per-country stations masks
+* per-country station masks
 * per-country evaluation
 * different federated averaging methods
 * local and global differential privacy

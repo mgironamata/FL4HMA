@@ -23,6 +23,23 @@ def make_dataarray(n_vars=3, n_time=4, n_lat=64, n_lon=64):
     )
 
 
+def make_precip_dataarray(n_vars=3, n_time=4, n_lat=64, n_lon=64):
+    """DataArray whose channel 0 is non-negative (precipitation-like)."""
+    rng = np.random.default_rng(7)
+    data = rng.standard_normal((n_vars, n_time, n_lat, n_lon)).astype(np.float32)
+    data[0] = np.abs(data[0]) * 5.0  # non-negative precip channel in mm
+    return xr.DataArray(
+        data,
+        dims=("variable", "time", "lat", "lon"),
+        coords={
+            "variable": [f"v{i}" for i in range(n_vars)],
+            "time": pd.to_datetime(np.arange(n_time), unit="D", origin="1998-01-01"),
+            "lat": np.linspace(25, 40, n_lat),
+            "lon": np.linspace(60, 105, n_lon),
+        },
+    )
+
+
 # ── constructor tests ─────────────────────────────────────────────────────────
 
 
@@ -322,3 +339,120 @@ class TestDataLoader:
         assert sparse_target.shape == (4, 1, 32, 32)
         assert input_mask.shape == (4, 32, 32)
         assert output_mask.shape == (4, 32, 32)
+
+
+# ── log transform tests ───────────────────────────────────────────────────────
+
+
+class TestLogTransform:
+    def test_log_transform_applied_to_correct_channel(self):
+        da = make_precip_dataarray()
+        raw_ch0 = da.values[0].astype(np.float32)
+        log_eps = 1.0
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=False,
+            log_transform_channel=0,
+            log_eps=log_eps,
+        )
+        expected = np.log(raw_ch0 + log_eps)
+        np.testing.assert_allclose(ds.data[0], expected, rtol=1e-5)
+
+    def test_log_transform_does_not_affect_other_channels(self):
+        da = make_precip_dataarray()
+        raw_ch1 = da.values[1].astype(np.float32)
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=False,
+            log_transform_channel=0,
+        )
+        np.testing.assert_array_equal(ds.data[1], raw_ch1)
+
+    def test_no_log_transform_by_default(self):
+        da = make_precip_dataarray()
+        raw_ch0 = da.values[0].astype(np.float32)
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=False,
+        )
+        np.testing.assert_array_equal(ds.data[0], raw_ch0)
+
+    def test_log_transform_then_zscore_mean_near_zero(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=True,
+            log_transform_channel=0,
+        )
+        assert abs(float(np.nanmean(ds.data[0]))) < 1e-5
+
+
+# ── denormalise tests ─────────────────────────────────────────────────────────
+
+
+class TestDenormalise:
+    def test_denormalise_inverts_zscore(self):
+        da = make_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=True,
+        )
+        raw_ch0 = da.values[0].astype(np.float32)
+        # Take a normalised tensor and denormalise it
+        normalised = torch.tensor(ds.data[0])
+        recovered = ds.denormalise(normalised, channel=0).numpy()
+        np.testing.assert_allclose(recovered, raw_ch0, rtol=1e-4, atol=1e-4)
+
+    def test_denormalise_no_normalize_is_identity(self):
+        da = make_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=False,
+        )
+        pred = torch.tensor([0.5, -1.0, 3.0])
+        recovered = ds.denormalise(pred)
+        torch.testing.assert_close(recovered, pred)
+
+    def test_denormalise_inverts_log_and_zscore(self):
+        da = make_precip_dataarray()
+        raw_ch0 = da.values[0].astype(np.float32)
+        log_eps = 1.0
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=True,
+            log_transform_channel=0,
+            log_eps=log_eps,
+        )
+        normalised = torch.tensor(ds.data[0])
+        recovered = ds.denormalise(normalised, channel=0).numpy()
+        np.testing.assert_allclose(recovered, raw_ch0, rtol=1e-4, atol=1e-4)
+
+    def test_denormalise_non_log_channel_unaffected_by_log_flag(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+            normalize=True,
+            log_transform_channel=0,
+        )
+        # Channel 1 is not log-transformed; denormalise should only invert z-score
+        normalised = torch.tensor(ds.data[1])
+        recovered = ds.denormalise(normalised, channel=1).numpy()
+        expected = da.values[1].astype(np.float32)
+        np.testing.assert_allclose(recovered, expected, rtol=1e-4, atol=1e-4)
+

@@ -9,8 +9,17 @@ class UNetCNN(nn.Module):
     Suitable for image reconstruction, completion, and sparse supervision tasks.
     """
 
-    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_filters: int = 32):
+    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_filters: int = 32, output_activation: str | None = None):
+        """Args:
+            output_activation: None (default) for linear output, appropriate when targets
+                are z-score normalised (both temperature and log-precipitation).
+                'softplus' or 'relu' only if targets are guaranteed non-negative
+                (e.g. min-max scaled precipitation).
+        """
         super(UNetCNN, self).__init__()
+        if output_activation not in (None, 'relu', 'softplus'):
+            raise ValueError(f"output_activation must be None, 'relu', or 'softplus', got {output_activation!r}")
+        self.output_activation = output_activation
 
         # Encoder (downsampling path)
         self.enc1 = self._conv_block(in_channels, base_filters)
@@ -73,7 +82,11 @@ class UNetCNN(nn.Module):
         dec1 = self.dec1(torch.cat([up1, enc1], dim=1))
 
         output = self.final_conv(dec1)
-        return torch.sigmoid(output)
+        if self.output_activation == 'relu':
+            return F.relu(output)
+        if self.output_activation == 'softplus':
+            return F.softplus(output)
+        return output
 
 
 def sparse_pixel_loss(

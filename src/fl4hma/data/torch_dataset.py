@@ -29,6 +29,12 @@ class StationPatchDataset(Dataset):
     patch_size : int
     stride : int
     normalize : bool
+    log_transform_channel : int or None
+        Channel index to apply ``log(x + log_eps)`` before z-scoring.
+        Use ``0`` for precipitation (the climate-variable channel).
+    log_eps : float
+        Epsilon added before the log transform to avoid ``log(0)``.
+        Default 1.0 is appropriate for daily precipitation in mm.
     mask_start_year : int
         The first year covered by a 3D yearly mask (default 1998).
     """
@@ -43,6 +49,8 @@ class StationPatchDataset(Dataset):
         patch_size: int = 32,
         stride: int = 32,
         normalize: bool = True,
+        log_transform_channel: Optional[int] = None,
+        log_eps: float = 1.0,
         dtype: torch.dtype = torch.float32,
         mask_start_year: int = 1998,
     ):
@@ -58,14 +66,25 @@ class StationPatchDataset(Dataset):
         self.stride = stride
         self.dtype = dtype
         self.mask_start_year = mask_start_year
+        self.log_transform_channel = log_transform_channel
+        self.log_eps = log_eps
 
         # Convert to numpy
         self.data = dataarray.values.astype(np.float32)
 
+        if log_transform_channel is not None:
+            self.data[log_transform_channel] = np.log(
+                self.data[log_transform_channel] + log_eps
+            )
+
+        n_channels = self.data.shape[0]
         if normalize:
             self.mean = np.nanmean(self.data, axis=(1, 2, 3), keepdims=True)
             self.std = np.nanstd(self.data, axis=(1, 2, 3), keepdims=True) + 1e-6
             self.data = (self.data - self.mean) / self.std
+        else:
+            self.mean = np.zeros((n_channels, 1, 1, 1), dtype=np.float32)
+            self.std = np.ones((n_channels, 1, 1, 1), dtype=np.float32)
 
         self.channels, self.time_len, self.lat_len, self.lon_len = self.data.shape
 
@@ -144,6 +163,24 @@ class StationPatchDataset(Dataset):
         sparse_target[0, ~output_mask] = -1.0
 
         return sparse_input, sparse_target, input_mask.float(), output_mask.float()
+
+    def denormalise(self, pred: torch.Tensor, channel: int = 0) -> torch.Tensor:
+        """Invert z-score (and log transform if applied) for model predictions.
+
+        Args:
+            pred: Model predictions in normalised space, any shape.
+            channel: Which dataset channel the predictions correspond to.
+                Defaults to 0 (the climate variable channel).
+
+        Returns:
+            Predictions in physical units (same shape as ``pred``).
+        """
+        mean = float(self.mean[channel].flat[0])
+        std = float(self.std[channel].flat[0])
+        out = pred * std + mean
+        if self.log_transform_channel == channel:
+            out = torch.exp(out) - self.log_eps
+        return out
 
     def _expand_yearly_to_daily(self, yearly_mask: np.ndarray) -> np.ndarray:
         """

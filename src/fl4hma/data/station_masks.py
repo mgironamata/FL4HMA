@@ -204,7 +204,7 @@ def generate_nonstationary_station_masks(
     """
     lon_bins = np.arange(lon_slice[0], lon_slice[1] + res, res)
     lat_bins = np.arange(lat_slice[0], lat_slice[1] + res, res)
-    year_bins = np.arange(year_range[0], year_range[1] + 1, 1)
+    year_bins = np.arange(year_range[0], year_range[1] + 2, 1)  # +2 for inclusive end
 
     stations = _load_ghcn_stations(ghcn_stations_path)
     inventory = _load_ghcn_inventory(ghcn_inventory_path)

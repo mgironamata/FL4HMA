@@ -12,8 +12,7 @@ from flwr.server.strategy import FedAvg
 from flwr.simulation import start_simulation
 from torch.utils.data import DataLoader
 
-from fl4hma.data.data import build_country_datasets
-from fl4hma.data.torch_dataset import StationPatchDataset
+from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
 from fl4hma.models.unet import UNetCNN
 from fl4hma.training.training import (
     _get_device,

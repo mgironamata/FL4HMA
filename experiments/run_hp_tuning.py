@@ -128,6 +128,7 @@ def main(config_path: str) -> None:
         variable=data_cfg["variable"],
         lon_slice=tuple(data_cfg["lon_slice"]),
         lat_slice=tuple(data_cfg["lat_slice"]),
+        elevation_path=data_cfg.get("elevation_path"),
     )
     print(f"  train={da_train.shape}  test={da_test.shape}\n")
 

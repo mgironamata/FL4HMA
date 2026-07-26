@@ -116,6 +116,8 @@ def run_centralised(
     base_filters: int = 32,
     patch_size: int = 32,
     stride: int = 32,
+    use_attention: bool = True,
+    output_activation: Optional[str] = None,
 ) -> Dict:
     """Train a single model on all data (centralised baseline).
 
@@ -144,6 +146,8 @@ def run_centralised(
         in_channels=in_channels,
         out_channels=1,
         base_filters=base_filters,
+        use_attention=use_attention,
+        output_activation=output_activation,
     ).to(device)
 
     print("=" * 60)

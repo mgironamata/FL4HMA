@@ -1,0 +1,48 @@
+# Hyperparameter grid search for the centralised UNet model.
+#
+# Each list under search_space defines the candidate values for that
+# hyperparameter.  The script generates the full Cartesian product, so
+# reduce any list to cut the number of trials.
+#
+# patch_size_stride_pairs: pairs of [patch_size, stride] that are always
+# tuned together (stride must be ≤ patch_size).
+#
+# Rough trial count with the defaults below:
+#   3 lr × 2 base_filters × 2 batch_size × 2 num_epochs
+#   × 2 patch_stride pairs × 2 use_attention × 2 output_activation
+#   = 192 trials.  Cut lists to reduce.
+
+experiment_name: "hp_tuning_centralised"
+
+data:
+  train_path: "/data/hpcdata/users/kenzi22/data/APHRODITE/daily/APHRO_MA_TAVE_025deg_V1808.1998-2007.nc"
+  test_path:  "/data/hpcdata/users/kenzi22/data/APHRODITE/daily/APHRO_MA_TAVE_025deg_V1808.2008-2011.nc"
+  variable:   "tave"
+  lon_slice:  [60.0, 105.0]
+  lat_slice:  [20.0,  40.0]
+  elevation_path: "data/elevation/cropped_elevation.nc"
+
+masks:
+  input_mask_path:  "data/station_masks/nonstat/tave_centralised_mask.npy"
+  output_mask_path: "data/station_masks/out_mask.npy"
+
+# Fixed for all trials
+model:
+  in_channels: 4  # variable + lat + lon + elevation
+
+# Search grid
+search_space:
+  lr:                    [0.001, 0.0005, 0.0001]
+  base_filters:          [16, 32]
+  batch_size:            [8, 16]
+  num_epochs:            [5, 10]
+  # [patch_size, stride] pairs — stride should be ≤ patch_size
+  patch_size_stride_pairs:
+    - [32, 16]
+    - [32, 32]
+  use_attention:         [true, false]
+  output_activation:     [null]
+
+output:
+  results_dir: "results/hp_tuning_centralised"
+  csv_file:    "results/hp_tuning_centralised/results.csv"

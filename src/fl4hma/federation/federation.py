@@ -12,8 +12,7 @@ from flwr.server.strategy import FedAvg
 from flwr.simulation import start_simulation
 from torch.utils.data import DataLoader
 
-from fl4hma.data.data import build_country_datasets
-from fl4hma.data.torch_dataset import StationPatchDataset
+from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
 from fl4hma.models.unet import UNetCNN
 from fl4hma.training.training import (
     _get_device,
@@ -116,6 +115,8 @@ def run_centralised(
     base_filters: int = 32,
     patch_size: int = 32,
     stride: int = 32,
+    use_attention: bool = True,
+    output_activation: Optional[str] = None,
 ) -> Dict:
     """Train a single model on all data (centralised baseline).
 
@@ -144,6 +145,8 @@ def run_centralised(
         in_channels=in_channels,
         out_channels=1,
         base_filters=base_filters,
+        use_attention=use_attention,
+        output_activation=output_activation,
     ).to(device)
 
     print("=" * 60)

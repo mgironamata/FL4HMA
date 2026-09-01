@@ -213,5 +213,8 @@ __marimo__/
 /station_data/masks_tave/
 
 /examples/data/
-/data/cifar-10-batches-py/
-/data/cifar_10_python.tar.gz
+data/*
+aphro_toy/*
+fl4hma/*
+figures/*
+results/*

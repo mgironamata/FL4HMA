@@ -9,8 +9,8 @@ Requirements:
     pip install "flwr[simulation]>=1.5"
 """
 
-import sys
 import os
+import sys
 
 # Ensure src/ and repo root are on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))

@@ -6,7 +6,6 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import xarray as xr
 from torch.utils.data import DataLoader
@@ -68,13 +67,33 @@ def evaluate_sparse_pixel(
     model: nn.Module,
     loader: DataLoader,
 ) -> Dict[str, float]:
-    """Evaluate on sparse pixel data.  Returns dict with mse, rmse, loss."""
+    """Evaluate on sparse pixel data.
+
+    ``mse`` is pooled over every labelled pixel the loader yields, so it is
+    independent of ``loader.batch_size`` and directly comparable across
+    experiments that batch differently.  ``rmse`` is its square root.
+
+    ``loss`` is the mean over batches of
+    :func:`~fl4hma.models.unet.sparse_pixel_loss`, i.e. the quantity minimised
+    during training.  It equals ``mse`` only when every batch contains the same
+    number of labelled pixels.
+
+    Args:
+        model: Model to evaluate.
+        loader: Loader yielding
+            ``(sparse_input, sparse_target, input_mask, output_mask)``.
+
+    Returns:
+        Dict with ``loss``, ``mse`` and ``rmse``.  ``mse`` and ``rmse`` are
+        ``nan`` when the loader yields no labelled pixels.
+    """
     device = _get_device()
     model.to(device)
     model.eval()
 
     total_loss = 0.0
-    total_mse = 0.0
+    total_sq_error = 0.0
+    total_pixels = 0
     n_batches = 0
 
     with torch.no_grad():
@@ -87,23 +106,20 @@ def evaluate_sparse_pixel(
             loss = sparse_pixel_loss(pred, sparse_tgt, output_mask)
             if loss is not None and not torch.isnan(loss):
                 total_loss += loss.item()
-
-                # MSE on labelled pixels
-                for b in range(pred.size(0)):
-                    mask_b = output_mask[b].bool()
-                    if mask_b.sum() > 0:
-                        mse_b = F.mse_loss(
-                            pred[b][:, mask_b],
-                            sparse_tgt[b][:, mask_b],
-                        )
-                        total_mse += mse_b.item()
                 n_batches += 1
+
+                # Squared error pooled over labelled pixels only
+                labelled = output_mask.bool().unsqueeze(1).expand_as(pred)
+                total_sq_error += ((pred - sparse_tgt) ** 2)[labelled].sum().item()
+                total_pixels += int(labelled.sum().item())
 
     if n_batches == 0:
         return {"loss": float("nan"), "mse": float("nan"), "rmse": float("nan")}
     avg_loss = total_loss / n_batches
-    avg_mse = total_mse / n_batches
-    return {"loss": avg_loss, "mse": avg_mse, "rmse": np.sqrt(avg_mse)}
+    if total_pixels == 0:
+        return {"loss": avg_loss, "mse": float("nan"), "rmse": float("nan")}
+    avg_mse = total_sq_error / total_pixels
+    return {"loss": avg_loss, "mse": avg_mse, "rmse": float(np.sqrt(avg_mse))}
 
 
 def evaluate_model_with_mask(

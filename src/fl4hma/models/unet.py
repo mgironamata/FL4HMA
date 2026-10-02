@@ -1,7 +1,28 @@
+import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+
+_NORMS = ("group", "batch")
+
+
+def _make_norm(norm: str, num_channels: int, num_groups: int) -> nn.Module:
+    """Build a normalisation layer.
+
+    Args:
+        norm: ``"group"`` for GroupNorm or ``"batch"`` for BatchNorm2d.
+        num_channels: Number of channels to normalise.
+        num_groups: Target number of GroupNorm groups. The largest common
+            divisor with ``num_channels`` is used so any channel count works.
+
+    Returns:
+        The normalisation module.
+    """
+    if norm == "batch":
+        return nn.BatchNorm2d(num_channels)
+    return nn.GroupNorm(math.gcd(num_groups, num_channels), num_channels)
 
 
 class AttentionGate(nn.Module):
@@ -15,21 +36,30 @@ class AttentionGate(nn.Module):
         F_g: Number of channels in the gating signal (upsampled decoder path).
         F_l: Number of channels in the skip connection (encoder path).
         F_int: Number of intermediate channels for the attention computation.
+        norm: ``"group"`` (default) or ``"batch"``.
+        num_groups: Target number of GroupNorm groups.
     """
 
-    def __init__(self, F_g: int, F_l: int, F_int: int):
+    def __init__(
+        self,
+        F_g: int,
+        F_l: int,
+        F_int: int,
+        norm: str = "group",
+        num_groups: int = 8,
+    ):
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, 1, bias=False),
-            nn.BatchNorm2d(F_int),
+            _make_norm(norm, F_int, num_groups),
         )
         self.W_x = nn.Sequential(
             nn.Conv2d(F_l, F_int, 1, bias=False),
-            nn.BatchNorm2d(F_int),
+            _make_norm(norm, F_int, num_groups),
         )
         self.psi = nn.Sequential(
             nn.Conv2d(F_int, 1, 1, bias=False),
-            nn.BatchNorm2d(1),
+            _make_norm(norm, 1, num_groups),
             nn.Sigmoid(),
         )
 
@@ -60,18 +90,31 @@ class UNetCNN(nn.Module):
         base_filters: int = 32,
         output_activation: Optional[str] = None,
         use_attention: bool = True,
+        norm: str = "group",
+        num_groups: int = 8,
     ):
         """Args:
-            output_activation: None (default) for linear output, appropriate when targets
-                are z-score normalised (both temperature and log-precipitation).
-                'softplus' or 'relu' only if targets are guaranteed non-negative
-                (e.g. min-max scaled precipitation).
-            use_attention: If True, add attention gates on every skip connection
-                (Attention U-Net). Recommended for sparse supervision tasks.
+        output_activation: None (default) for linear output, appropriate when targets
+            are z-score normalised (both temperature and log-precipitation).
+            'softplus' or 'relu' only if targets are guaranteed non-negative
+            (e.g. min-max scaled precipitation).
+        use_attention: If True, add attention gates on every skip connection
+            (Attention U-Net). Recommended for sparse supervision tasks.
+        norm: ``"group"`` (default) for GroupNorm, which has no running
+            statistics and treats each sample independently, as
+            per-sample DP-SGD requires. ``"batch"`` restores BatchNorm,
+            e.g. to load checkpoints trained before the switch.
+        num_groups: Target number of GroupNorm groups per layer.
         """
         super(UNetCNN, self).__init__()
-        if output_activation not in (None, 'relu', 'softplus'):
-            raise ValueError(f"output_activation must be None, 'relu', or 'softplus', got {output_activation!r}")
+        if norm not in _NORMS:
+            raise ValueError(f"norm must be one of {_NORMS}, got {norm!r}")
+        self.norm = norm
+        self.num_groups = num_groups
+        if output_activation not in (None, "relu", "softplus"):
+            raise ValueError(
+                f"output_activation must be None, 'relu', or 'softplus', got {output_activation!r}"
+            )
         self.output_activation = output_activation
         self.use_attention = use_attention
 
@@ -84,11 +127,19 @@ class UNetCNN(nn.Module):
         self.bottleneck = self._conv_block(base_filters * 4, base_filters * 8)
 
         # Decoder (upsampling path)
-        self.upconv3 = nn.ConvTranspose2d(base_filters * 8, base_filters * 4, 2, stride=2)
-        self.dec3 = self._conv_block(base_filters * 8, base_filters * 4)  # 8 = 4 + 4 (skip)
+        self.upconv3 = nn.ConvTranspose2d(
+            base_filters * 8, base_filters * 4, 2, stride=2
+        )
+        self.dec3 = self._conv_block(
+            base_filters * 8, base_filters * 4
+        )  # 8 = 4 + 4 (skip)
 
-        self.upconv2 = nn.ConvTranspose2d(base_filters * 4, base_filters * 2, 2, stride=2)
-        self.dec2 = self._conv_block(base_filters * 4, base_filters * 2)  # 4 = 2 + 2 (skip)
+        self.upconv2 = nn.ConvTranspose2d(
+            base_filters * 4, base_filters * 2, 2, stride=2
+        )
+        self.dec2 = self._conv_block(
+            base_filters * 4, base_filters * 2
+        )  # 4 = 2 + 2 (skip)
 
         self.upconv1 = nn.ConvTranspose2d(base_filters * 2, base_filters, 2, stride=2)
         self.dec1 = self._conv_block(base_filters * 2, base_filters)  # 2 = 1 + 1 (skip)
@@ -102,23 +153,35 @@ class UNetCNN(nn.Module):
         # Attention gates (one per skip connection, coarsest to finest)
         if use_attention:
             self.att3 = AttentionGate(
-                F_g=base_filters * 4, F_l=base_filters * 4, F_int=base_filters * 2
+                F_g=base_filters * 4,
+                F_l=base_filters * 4,
+                F_int=base_filters * 2,
+                norm=norm,
+                num_groups=num_groups,
             )
             self.att2 = AttentionGate(
-                F_g=base_filters * 2, F_l=base_filters * 2, F_int=base_filters
+                F_g=base_filters * 2,
+                F_l=base_filters * 2,
+                F_int=base_filters,
+                norm=norm,
+                num_groups=num_groups,
             )
             self.att1 = AttentionGate(
-                F_g=base_filters, F_l=base_filters, F_int=max(base_filters // 2, 1)
+                F_g=base_filters,
+                F_l=base_filters,
+                F_int=max(base_filters // 2, 1),
+                norm=norm,
+                num_groups=num_groups,
             )
 
     def _conv_block(self, in_channels: int, out_channels: int) -> nn.Module:
         """Create a convolutional block with two conv layers."""
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            _make_norm(self.norm, out_channels, self.num_groups),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            _make_norm(self.norm, out_channels, self.num_groups),
             nn.ReLU(inplace=True),
         )
 
@@ -134,26 +197,32 @@ class UNetCNN(nn.Module):
         # Decoder path with (optionally attended) skip connections
         up3 = self.upconv3(bottleneck)
         if up3.shape != enc3.shape:
-            up3 = F.interpolate(up3, size=enc3.shape[2:], mode='bilinear', align_corners=False)
+            up3 = F.interpolate(
+                up3, size=enc3.shape[2:], mode="bilinear", align_corners=False
+            )
         skip3 = self.att3(g=up3, x=enc3) if self.use_attention else enc3
         dec3 = self.dec3(torch.cat([up3, skip3], dim=1))
 
         up2 = self.upconv2(dec3)
         if up2.shape != enc2.shape:
-            up2 = F.interpolate(up2, size=enc2.shape[2:], mode='bilinear', align_corners=False)
+            up2 = F.interpolate(
+                up2, size=enc2.shape[2:], mode="bilinear", align_corners=False
+            )
         skip2 = self.att2(g=up2, x=enc2) if self.use_attention else enc2
         dec2 = self.dec2(torch.cat([up2, skip2], dim=1))
 
         up1 = self.upconv1(dec2)
         if up1.shape != enc1.shape:
-            up1 = F.interpolate(up1, size=enc1.shape[2:], mode='bilinear', align_corners=False)
+            up1 = F.interpolate(
+                up1, size=enc1.shape[2:], mode="bilinear", align_corners=False
+            )
         skip1 = self.att1(g=up1, x=enc1) if self.use_attention else enc1
         dec1 = self.dec1(torch.cat([up1, skip1], dim=1))
 
         output = self.final_conv(dec1)
-        if self.output_activation == 'relu':
+        if self.output_activation == "relu":
             return F.relu(output)
-        if self.output_activation == 'softplus':
+        if self.output_activation == "softplus":
             return F.softplus(output)
         return output
 
@@ -184,7 +253,9 @@ def sparse_pixel_loss(
         if labeled_mask.sum() > 0:
             pred_labeled = predictions[b][:, labeled_mask]
             target_labeled = targets[b][:, labeled_mask]
-            total_loss = total_loss + F.mse_loss(pred_labeled, target_labeled, reduction='sum')
+            total_loss = total_loss + F.mse_loss(
+                pred_labeled, target_labeled, reduction="sum"
+            )
             total_pixels += labeled_mask.sum().item() * predictions.size(1)
 
     return total_loss / max(1, total_pixels)

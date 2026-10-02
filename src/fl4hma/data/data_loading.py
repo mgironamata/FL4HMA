@@ -1,9 +1,12 @@
 """APHRODITE data loading """
 
+import warnings
 from typing import Optional, Tuple
 
 import numpy as np
 import xarray as xr
+
+warnings.filterwarnings("ignore", category=xr.SerializationWarning)
 
 
 def load_aphro_data(

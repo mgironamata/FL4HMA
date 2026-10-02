@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import flwr as fl
@@ -28,13 +29,14 @@ import torch.nn as nn
 import torch.optim as optim
 import xarray as xr
 from flwr.client import NumPyClient
-from flwr.common import Context, FitRes, NDArrays, Parameters, Scalar
+from flwr.common import FitRes, NDArrays, Parameters, Scalar
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
-from flwr.simulation import start_simulation
+from torch.func import functional_call, grad, vmap
 from torch.utils.data import DataLoader
 
 from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
+from fl4hma.federation.simulation import run_ray_simulation
 from fl4hma.models.unet import UNetCNN, sparse_pixel_loss
 from fl4hma.training.training import (
     _get_device,
@@ -133,11 +135,21 @@ class DPAccountant:
                     rdp[i] = min(subsampled, full_batch_rdp)
         return rdp
 
-    def step(self, noise_multiplier: float, sample_rate: float = 1.0) -> None:
-        """Record one DP mechanism application (one training step or round)."""
+    def step(
+        self, noise_multiplier: float, sample_rate: float = 1.0, num_steps: int = 1
+    ) -> None:
+        """Record DP mechanism applications (training steps or rounds).
+
+        Args:
+            noise_multiplier: Noise multiplier z of each application.
+            sample_rate: Sampling rate q of each application.
+            num_steps: Number of identical applications to record at once;
+                RDP composes additively, so this equals calling ``step``
+                ``num_steps`` times.
+        """
         rdp = self._compute_rdp_gaussian(noise_multiplier, sample_rate)
-        self._rdp_eps += rdp
-        self._steps += 1
+        self._rdp_eps += rdp * num_steps
+        self._steps += num_steps
 
     def get_epsilon(self, delta: Optional[float] = None) -> float:
         """Convert accumulated RDP to (ε, δ)-DP."""
@@ -167,25 +179,89 @@ class DPAccountant:
 # ---------------------------------------------------------------------------
 
 
-def _clip_gradients(model: nn.Module, max_norm: float) -> float:
-    """Clip per-parameter gradients and return total gradient norm."""
-    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-    return total_norm.item()
+def per_sample_gradients(
+    model: nn.Module,
+    sparse_in: torch.Tensor,
+    sparse_tgt: torch.Tensor,
+    output_mask: torch.Tensor,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Compute the gradient of each sample's loss separately.
+
+    Each sample's loss is the MSE over its own labelled pixels, so
+    ``sum(losses * counts) / sum(counts)`` equals ``sparse_pixel_loss`` on the
+    whole batch.
+
+    Args:
+        model: Model without BatchNorm (whose batch statistics would couple
+            samples and make per-sample gradients meaningless).
+        sparse_in: Inputs, shape (B, C, H, W).
+        sparse_tgt: Targets, shape (B, 1, H, W).
+        output_mask: Labelled-pixel mask, shape (B, H, W).
+
+    Returns:
+        ``(grads, losses, counts)``: per-parameter gradients with a leading
+        batch dimension, per-sample losses (B,), and labelled-pixel counts (B,).
+        Samples without labelled pixels get zero loss and zero gradient.
+
+    Raises:
+        ValueError: If the model contains BatchNorm layers.
+    """
+    if any(isinstance(m, nn.modules.batchnorm._BatchNorm) for m in model.modules()):
+        raise ValueError(
+            "per-sample DP-SGD needs a model without BatchNorm; use norm='group'"
+        )
+    params = {k: v.detach() for k, v in model.named_parameters()}
+    buffers = {k: v.detach() for k, v in model.named_buffers()}
+
+    def sample_loss(p, x, y, m):
+        pred = functional_call(model, (p, buffers), (x.unsqueeze(0),))[0]
+        count = m.sum()
+        loss = (((pred - y) ** 2).sum(0) * m).sum() / count.clamp_min(1)
+        return loss, (loss, count)
+
+    grads, (losses, counts) = vmap(
+        grad(sample_loss, has_aux=True), in_dims=(None, 0, 0, 0)
+    )(params, sparse_in, sparse_tgt, output_mask)
+    return grads, losses.detach(), counts.detach()
 
 
-def _add_noise_to_gradients(
-    model: nn.Module, noise_std: float, device: torch.device
-) -> None:
-    """Add Gaussian noise to model gradients (in-place)."""
-    for param in model.parameters():
-        if param.grad is not None:
-            noise = torch.normal(
-                mean=0.0,
-                std=noise_std,
-                size=param.grad.shape,
-                device=device,
+def privatise_gradients(
+    per_sample_grads: Dict[str, torch.Tensor],
+    max_norm: float,
+    noise_std: float,
+    generator: Optional[torch.Generator] = None,
+) -> Dict[str, torch.Tensor]:
+    """Clip each sample's gradient, sum, add Gaussian noise and average.
+
+    This is the DP-SGD gradient: ``(Σ_i clip(g_i, C) + N(0, σ²)) / B`` with
+    ``σ = noise_std`` (normally ``noise_multiplier × C``).
+
+    Args:
+        per_sample_grads: Gradients with a leading batch dimension B, e.g.
+            from ``per_sample_gradients``.
+        max_norm: Per-sample L2 clipping bound C, over all parameters jointly.
+        noise_std: Std of the Gaussian noise added to the summed gradient.
+        generator: Optional RNG for the noise (for reproducibility in tests).
+
+    Returns:
+        Private gradients, one per parameter, without the batch dimension.
+    """
+    grads = list(per_sample_grads.values())
+    batch_size = grads[0].shape[0]
+    norms = torch.sqrt(sum(g.reshape(batch_size, -1).pow(2).sum(1) for g in grads))
+    scale = (max_norm / (norms + 1e-12)).clamp(max=1.0)
+    private = {}
+    for name, g in per_sample_grads.items():
+        summed = torch.einsum("b,b...->...", scale, g)
+        if noise_std > 0:
+            summed = summed + noise_std * torch.randn(
+                summed.shape,
+                generator=generator,
+                device=summed.device,
+                dtype=summed.dtype,
             )
-            param.grad.add_(noise)
+        private[name] = summed / batch_size
+    return private
 
 
 def dp_train_sparse_pixel(
@@ -196,26 +272,23 @@ def dp_train_sparse_pixel(
     lr: float = 0.001,
     accountant: Optional[DPAccountant] = None,
 ) -> Tuple[float, DPAccountant]:
-    """Train with local DP-SGD (per-batch gradient clipping + noise).
+    """Train with local DP-SGD (per-sample gradient clipping + noise).
 
-    Parameters
-    ----------
-    model : nn.Module
-        Model to train.
-    loader : DataLoader
-        Training data loader.
-    dp_config : DPConfig
-        DP configuration.
-    epochs : int
-        Number of local epochs.
-    lr : float
-        Learning rate.
-    accountant : DPAccountant or None
-        Privacy accountant (created if not given).
+    Each step clips every sample's gradient to ``dp_config.max_grad_norm``,
+    sums them, adds N(0, (noise_multiplier × max_grad_norm)²) and divides by
+    the batch size, then takes an Adam step on that private gradient.
 
-    Returns
-    -------
-    (avg_loss, accountant)
+    Args:
+        model: Model to train; must not contain BatchNorm.
+        loader: Training data loader.
+        dp_config: DP configuration.
+        epochs: Number of local epochs.
+        lr: Learning rate.
+        accountant: Privacy accountant (created if not given).
+
+    Returns:
+        ``(avg_loss, accountant)``; ``avg_loss`` is the mean over steps of the
+        batch loss pooled over labelled pixels, as in ``train_sparse_pixel``.
     """
     if accountant is None:
         accountant = DPAccountant(target_delta=dp_config.target_delta)
@@ -228,8 +301,7 @@ def dp_train_sparse_pixel(
     max_norm = dp_config.max_grad_norm
     noise_std = dp_config.noise_multiplier * max_norm
     batch_size = loader.batch_size or 1
-    dataset_size = len(loader.dataset)
-    sample_rate = batch_size / dataset_size
+    sample_rate = batch_size / len(loader.dataset)
 
     total_loss = 0.0
     n_batches = 0
@@ -240,26 +312,55 @@ def dp_train_sparse_pixel(
             sparse_tgt = sparse_tgt.to(device)
             output_mask = output_mask.to(device)
 
+            grads, losses, counts = per_sample_gradients(
+                model, sparse_in, sparse_tgt, output_mask
+            )
+            private = privatise_gradients(grads, max_norm, noise_std)
+
             optimizer.zero_grad()
-            pred = model(sparse_in)
-            loss = sparse_pixel_loss(pred, sparse_tgt, output_mask)
+            for name, param in model.named_parameters():
+                param.grad = private[name]
+            optimizer.step()
 
-            if loss is not None and not torch.isnan(loss):
-                loss.backward()
-
-                # DP-SGD: clip + noise
-                _clip_gradients(model, max_norm)
-                _add_noise_to_gradients(model, noise_std, device)
-
-                optimizer.step()
-                total_loss += loss.item()
-                n_batches += 1
-
-                # Account for this step
-                accountant.step(dp_config.noise_multiplier, sample_rate)
+            total_loss += ((losses * counts).sum() / counts.sum().clamp_min(1)).item()
+            n_batches += 1
+            accountant.step(dp_config.noise_multiplier, sample_rate)
 
     avg_loss = total_loss / max(1, n_batches)
     return avg_loss, accountant
+
+
+def local_dp_epsilon(
+    dp_config: DPConfig,
+    dataset_size: int,
+    batch_size: int,
+    local_epochs: int,
+    num_rounds: int,
+) -> float:
+    """Total local DP-SGD ε spent by one client over a whole simulation.
+
+    Flower rebuilds clients every round, so a client's own accountant only
+    sees one round; this composes every step the client takes across all
+    rounds.
+
+    Args:
+        dp_config: DP configuration (noise multiplier and δ).
+        dataset_size: Number of training samples on the client.
+        batch_size: Local batch size.
+        local_epochs: Local epochs per round.
+        num_rounds: Number of federated rounds.
+
+    Returns:
+        ε at ``dp_config.target_delta`` (``inf`` if the noise multiplier is 0).
+    """
+    steps = num_rounds * local_epochs * math.ceil(dataset_size / batch_size)
+    accountant = DPAccountant(target_delta=dp_config.target_delta)
+    accountant.step(
+        dp_config.noise_multiplier,
+        sample_rate=batch_size / dataset_size,
+        num_steps=steps,
+    )
+    return accountant.epsilon
 
 
 # ---------------------------------------------------------------------------
@@ -271,21 +372,33 @@ def clip_model_update(
     original_params: List[np.ndarray],
     updated_params: List[np.ndarray],
     clip_norm: float,
+    mask: Optional[List[bool]] = None,
 ) -> List[np.ndarray]:
     """Clip a model update (Δ = updated - original) to a maximum L2 norm.
 
-    Returns the clipped updated parameters (original + clipped_Δ).
+    Args:
+        original_params: Parameters before local training.
+        updated_params: Parameters after local training.
+        clip_norm: Maximum L2 norm of the update.
+        mask: If given, only entries where True are included in the norm and
+            clipped; the others (e.g. BatchNorm buffers such as
+            ``num_batches_tracked``) are passed through unchanged. Without it,
+            such buffers dominate the norm and shrink the weight update.
+
+    Returns:
+        The clipped updated parameters (original + clipped Δ).
     """
+    if mask is None:
+        mask = [True] * len(original_params)
     deltas = [u - o for u, o in zip(updated_params, original_params)]
-    flat_delta = np.concatenate([d.ravel() for d in deltas])
+    flat_delta = np.concatenate([d.ravel() for d, keep in zip(deltas, mask) if keep])
     delta_norm = np.linalg.norm(flat_delta)
 
-    if delta_norm > clip_norm:
-        scale = clip_norm / delta_norm
-        deltas = [d * scale for d in deltas]
-
-    clipped_params = [o + d for o, d in zip(original_params, deltas)]
-    return clipped_params
+    scale = clip_norm / delta_norm if delta_norm > clip_norm else 1.0
+    return [
+        o + d * scale if keep else u
+        for o, d, u, keep in zip(original_params, deltas, updated_params, mask)
+    ]
 
 
 def add_noise_to_parameters(
@@ -455,7 +568,10 @@ class DPFedAvg(FedAvg):
             for client_proxy, fit_res in results:
                 client_params = fl.common.parameters_to_ndarrays(fit_res.parameters)
                 clipped = clip_model_update(
-                    self._global_params, client_params, self.dp_config.clip_norm
+                    self._global_params,
+                    client_params,
+                    self.dp_config.clip_norm,
+                    mask=self._trainable_mask,
                 )
                 fit_res_new = FitRes(
                     status=fit_res.status,
@@ -612,17 +728,15 @@ def run_federated_dp(
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
     # --- Client factory ---
-    def client_fn(context: Context):
-        cid = int(context.node_config["partition-id"])
-        return DPAphroFlowerClient(
-            train_ds=client_list[cid],
-            dp_config=dp_config,
-            local_epochs=local_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            in_channels=in_channels,
-            base_filters=base_filters,
-        ).to_client()
+    build_client = partial(
+        DPAphroFlowerClient,
+        dp_config=dp_config,
+        local_epochs=local_epochs,
+        batch_size=batch_size,
+        lr=lr,
+        in_channels=in_channels,
+        base_filters=base_filters,
+    )
 
     # --- Strategy ---
     initial_model = UNetCNN(
@@ -663,15 +777,11 @@ def run_federated_dp(
     )
 
     # --- Simulation ---
-    history = start_simulation(
-        client_fn=client_fn,
-        num_clients=num_clients,
-        config=fl.server.ServerConfig(num_rounds=num_rounds),
+    history = run_ray_simulation(
+        client_list,
+        build_client,
+        num_rounds=num_rounds,
         strategy=strategy,
-        client_resources={
-            "num_cpus": 1,
-            "num_gpus": (1.0 / num_clients) if torch.cuda.is_available() else 0.0,
-        },
     )
 
     # --- Collect results ---
@@ -695,6 +805,20 @@ def run_federated_dp(
 
     # Privacy summary
     global_epsilon = strategy.accountant.epsilon if dp_config.global_dp else None
+    local_epsilon = (
+        {
+            name: local_dp_epsilon(
+                dp_config,
+                dataset_size=len(ds),
+                batch_size=batch_size,
+                local_epochs=local_epochs,
+                num_rounds=num_rounds,
+            )
+            for name, ds in client_datasets.items()
+        }
+        if dp_config.local_dp
+        else None
+    )
 
     print()
     print(f"Final DP-federated test MSE  after {num_rounds} rounds: {final_mse:.6f}")
@@ -704,6 +828,9 @@ def run_federated_dp(
             f"Global DP budget: ε = {global_epsilon:.4f}, "
             f"δ = {dp_config.target_delta}"
         )
+    if local_epsilon is not None:
+        for name, eps in local_epsilon.items():
+            print(f"Local DP budget ({name}): ε = {eps:.4f}")
 
     return {
         "model": final_model,
@@ -716,6 +843,7 @@ def run_federated_dp(
         "final_rmse": final_rmse,
         "dp_config": dp_config,
         "global_epsilon": global_epsilon,
+        "local_epsilon": local_epsilon,
         "global_accountant": strategy.accountant,
         "config": {
             "num_clients": num_clients,

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from fl4hma.training.training import evaluate_sparse_pixel
+from fl4hma.training.training import evaluate_sparse_pixel, train_sparse_pixel
 
 
 class ChannelZeroModel(nn.Module):
@@ -149,3 +149,68 @@ class TestDegenerateCases:
         assert np.isnan(metrics["loss"])
         assert np.isnan(metrics["mse"])
         assert np.isnan(metrics["rmse"])
+
+
+def make_regression_loader(n: int = 16, size: int = 4) -> DataLoader:
+    """Loader with random inputs and targets so every weight gets a gradient."""
+    gen = torch.Generator().manual_seed(0)
+    sparse_in = torch.randn(n, 3, size, size, generator=gen)
+    sparse_tgt = torch.randn(n, 1, size, size, generator=gen) * 5.0
+    input_mask = torch.ones(n, size, size)
+    out_mask = torch.ones(n, size, size)
+    ds = TensorDataset(sparse_in, sparse_tgt, input_mask, out_mask)
+    return DataLoader(ds, batch_size=4, shuffle=False)
+
+
+def _train_and_measure_drift(proximal_mu: float, **kwargs) -> tuple:
+    torch.manual_seed(0)
+    model = nn.Conv2d(3, 1, kernel_size=1)
+    start = [p.detach().clone() for p in model.parameters()]
+    loss = train_sparse_pixel(
+        model,
+        make_regression_loader(),
+        epochs=20,
+        lr=0.05,
+        proximal_mu=proximal_mu,
+        **kwargs,
+    )
+    drift = sum(
+        ((p.detach().cpu() - s) ** 2).sum() for p, s in zip(model.parameters(), start)
+    )
+    return loss, float(drift)
+
+
+class TestProximalTerm:
+    def test_zero_mu_matches_default(self):
+        torch.manual_seed(0)
+        model = nn.Conv2d(3, 1, kernel_size=1)
+        train_sparse_pixel(model, make_regression_loader(), epochs=2, lr=0.05)
+        default = [p.detach().clone() for p in model.parameters()]
+
+        torch.manual_seed(0)
+        model = nn.Conv2d(3, 1, kernel_size=1)
+        train_sparse_pixel(
+            model, make_regression_loader(), epochs=2, lr=0.05, proximal_mu=0.0
+        )
+
+        for a, b in zip(default, model.parameters()):
+            torch.testing.assert_close(a, b.detach())
+
+    def test_positive_mu_keeps_weights_near_start(self):
+        _, drift_free = _train_and_measure_drift(0.0)
+        _, drift_prox = _train_and_measure_drift(100.0)
+
+        assert drift_prox < 0.5 * drift_free
+
+    def test_drift_decreases_with_mu(self):
+        drifts = [_train_and_measure_drift(mu)[1] for mu in (0.0, 1.0, 100.0)]
+
+        assert drifts[0] > drifts[1] > drifts[2]
+
+    def test_negative_mu_raises(self):
+        with pytest.raises(ValueError, match="proximal_mu"):
+            train_sparse_pixel(
+                nn.Conv2d(3, 1, kernel_size=1),
+                make_regression_loader(),
+                proximal_mu=-1.0,
+            )

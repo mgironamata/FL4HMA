@@ -1,10 +1,12 @@
+import pickle
+
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 import xarray as xr
 
-from fl4hma.data.torch_dataset import StationPatchDataset
+from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
 
 
 def make_dataarray(n_vars=3, n_time=4, n_lat=64, n_lon=64):
@@ -456,3 +458,112 @@ class TestDenormalise:
         expected = da.values[1].astype(np.float32)
         np.testing.assert_allclose(recovered, expected, rtol=1e-4, atol=1e-4)
 
+
+# ── shared data across country datasets ─────────────────────────────────────
+
+
+def _save_masks(tmp_path, n_masks, shape=(64, 64)):
+    rng = np.random.default_rng(1)
+    paths = []
+    for k in range(n_masks):
+        path = tmp_path / f"mask_{k}.npy"
+        np.save(path, rng.random(shape) > 0.5)
+        paths.append(str(path))
+    return paths
+
+
+class TestSharedData:
+    def test_does_not_keep_dataarray(self):
+        ds = StationPatchDataset(
+            make_dataarray(n_time=2), input_sparsity=0.5, output_sparsity=0.5
+        )
+        assert not hasattr(ds, "da")
+
+    def test_with_input_mask_shares_data(self, tmp_path):
+        mask_a, mask_b = _save_masks(tmp_path, 2)
+        base = StationPatchDataset(
+            make_dataarray(n_time=2),
+            input_mask_path=mask_a,
+            output_sparsity=0.5,
+        )
+        other = base.with_input_mask(mask_b)
+        assert other.data is base.data
+        assert other.indices is base.indices
+        assert other is not base
+
+    def test_with_input_mask_replaces_mask_only(self, tmp_path):
+        mask_a, mask_b = _save_masks(tmp_path, 2)
+        base = StationPatchDataset(
+            make_dataarray(n_time=2),
+            input_mask_path=mask_a,
+            output_sparsity=0.5,
+        )
+        other = base.with_input_mask(mask_b)
+        np.testing.assert_array_equal(base.station_mask, np.load(mask_a))
+        np.testing.assert_array_equal(other.station_mask, np.load(mask_b))
+
+    def test_with_input_mask_matches_fresh_dataset(self, tmp_path):
+        mask_a, mask_b = _save_masks(tmp_path, 2)
+        da = make_dataarray(n_time=2)
+        base = StationPatchDataset(da, input_mask_path=mask_a, output_mask_path=mask_a)
+        derived = base.with_input_mask(mask_b)
+        fresh = StationPatchDataset(da, input_mask_path=mask_b, output_mask_path=mask_a)
+        for got, expected in zip(derived[1], fresh[1]):
+            torch.testing.assert_close(got, expected)
+
+    def test_with_input_mask_expands_yearly_mask(self, tmp_path):
+        yearly = np.random.default_rng(0).random((5, 64, 64)) > 0.5
+        mask_path = tmp_path / "yearly_mask.npy"
+        np.save(mask_path, yearly)
+        base = StationPatchDataset(
+            make_dataarray(n_time=365 * 3),
+            input_sparsity=0.5,
+            output_sparsity=0.5,
+        )
+        derived = base.with_input_mask(str(mask_path))
+        assert derived.station_mask.shape == (365 * 3 + 1, 64, 64)
+
+    def test_getitem_works_on_read_only_data(self, tmp_path):
+        (mask,) = _save_masks(tmp_path, 1)
+        ds = StationPatchDataset(
+            make_dataarray(n_time=2), input_mask_path=mask, output_sparsity=0.5
+        )
+        ds.data.setflags(write=False)
+        ds.station_mask.setflags(write=False)
+        sparse_input, _, _, _ = ds[0]
+        assert sparse_input.shape == (3, 32, 32)
+
+
+class TestBuildCountryDatasets:
+    def test_all_countries_share_one_array(self, tmp_path):
+        paths = _save_masks(tmp_path, 3)
+        datasets = build_country_datasets(
+            make_dataarray(n_time=2),
+            {f"c{k}": p for k, p in enumerate(paths)},
+            output_mask_path=paths[0],
+        )
+        arrays = {id(ds.data) for ds in datasets.values()}
+        assert len(arrays) == 1
+
+    def test_each_country_gets_its_own_mask(self, tmp_path):
+        paths = _save_masks(tmp_path, 3)
+        datasets = build_country_datasets(
+            make_dataarray(n_time=2),
+            {f"c{k}": p for k, p in enumerate(paths)},
+            output_mask_path=paths[0],
+        )
+        for ds, path in zip(datasets.values(), paths):
+            np.testing.assert_array_equal(ds.station_mask, np.load(path))
+
+    def test_pickled_size_does_not_scale_with_countries(self, tmp_path):
+        paths = _save_masks(tmp_path, 4)
+        da = make_dataarray(n_time=8)
+        one = build_country_datasets(da, {"c0": paths[0]}, output_mask_path=paths[0])
+        four = build_country_datasets(
+            da,
+            {f"c{k}": p for k, p in enumerate(paths)},
+            output_mask_path=paths[0],
+        )
+        size_one = len(pickle.dumps(list(one.values())))
+        size_four = len(pickle.dumps(list(four.values())))
+        assert size_four < 1.5 * size_one

@@ -35,12 +35,34 @@ def train_sparse_pixel(
     loader: DataLoader,
     epochs: int = 1,
     lr: float = 0.001,
+    proximal_mu: float = 0.0,
 ) -> float:
-    """Train U-Net on sparse pixel data.  Returns average loss."""
+    """Train U-Net on sparse pixel data.
+
+    Args:
+        model: Model to train in place.
+        loader: Loader yielding ``(sparse_in, sparse_tgt, input_mask,
+            output_mask)``.
+        epochs: Number of passes over ``loader``.
+        lr: Adam learning rate.
+        proximal_mu: FedProx weight. If > 0, adds
+            ``proximal_mu / 2 * ||w - w_0||^2`` to the loss, where ``w_0`` are
+            the trainable parameters at the start of this call.
+
+    Returns:
+        Mean data loss over batches, excluding the proximal term.
+
+    Raises:
+        ValueError: If ``proximal_mu`` is negative.
+    """
+    if proximal_mu < 0.0:
+        raise ValueError(f"proximal_mu must be >= 0, got {proximal_mu}")
     device = _get_device()
     model.to(device)
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    global_params = [p.detach().clone() for p in trainable]
 
     total_loss = 0.0
     n_batches = 0
@@ -55,7 +77,12 @@ def train_sparse_pixel(
             pred = model(sparse_in)
             loss = sparse_pixel_loss(pred, sparse_tgt, output_mask)
             if loss is not None and not torch.isnan(loss):
-                loss.backward()
+                objective = loss
+                if proximal_mu > 0.0:
+                    objective = loss + (proximal_mu / 2) * sum(
+                        (p - g).pow(2).sum() for p, g in zip(trainable, global_params)
+                    )
+                objective.backward()
                 optimizer.step()
                 total_loss += loss.item()
                 n_batches += 1

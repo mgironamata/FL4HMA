@@ -17,6 +17,7 @@ dependencies = [
     "pandas", 
     "scikit-learn",
     "pyyaml",
+    "pydantic>=2",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +44,10 @@ federated = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["fl4hma*"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = ["slow: end-to-end tests that start Ray (run with -m slow)"]
 
 [tool.isort]
 profile = "black"

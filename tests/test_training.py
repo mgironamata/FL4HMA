@@ -149,3 +149,114 @@ class TestDegenerateCases:
         assert np.isnan(metrics["loss"])
         assert np.isnan(metrics["mse"])
         assert np.isnan(metrics["rmse"])
+
+
+# ── loss-config integration ───────────────────────────────────────────────────
+
+
+from fl4hma.models.unet import UNetCNN  # noqa: E402
+from fl4hma.training.losses import LossConfig  # noqa: E402
+from fl4hma.training.training import train_sparse_pixel  # noqa: E402
+
+
+def precip_loader(n=8, h=32, w=32, batch_size=4, seed=0):
+    """Loader with non-negative physical-unit targets, as Tweedie requires."""
+    rng = np.random.default_rng(seed)
+    x = torch.from_numpy(rng.standard_normal((n, 3, h, w)).astype(np.float32))
+    y = torch.from_numpy((rng.gamma(0.4, 6.0, (n, 1, h, w))).astype(np.float32))
+    y[rng.random((n, 1, h, w)) < 0.6] = 0.0  # dry days
+    mask = torch.ones(n, h, w)
+    return DataLoader(
+        TensorDataset(x, y, torch.ones(n, h, w), mask),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+
+def small_unet(dropout=0.0):
+    return UNetCNN(in_channels=3, out_channels=1, base_filters=8, dropout=dropout)
+
+
+class TestDefaultUnchanged:
+    def test_evaluate_without_config_matches_explicit_mse(self, model):
+        rng = np.random.default_rng(3)
+        errors, mask = rng.standard_normal((8, 4, 4)), np.ones((8, 4, 4))
+        loader = make_loader(errors, mask, 4)
+
+        implicit = evaluate_sparse_pixel(model, loader)
+        explicit = evaluate_sparse_pixel(model, loader, LossConfig(name="mse"))
+
+        assert implicit["mse"] == pytest.approx(explicit["mse"], rel=1e-6)
+
+    def test_deterministic_crps_equals_mae(self, model):
+        """A point forecast's CRPS is its absolute error, so the metric is
+        comparable across deterministic and ensemble models."""
+        rng = np.random.default_rng(4)
+        errors, mask = rng.standard_normal((8, 4, 4)), np.ones((8, 4, 4))
+
+        metrics = evaluate_sparse_pixel(model, make_loader(errors, mask, 4))
+
+        assert metrics["crps"] == pytest.approx(metrics["mae"], rel=1e-6)
+        assert metrics["spread"] == pytest.approx(0.0, abs=1e-9)
+
+
+class TestCRPSTraining:
+    def test_train_returns_finite_loss(self):
+        cfg = LossConfig(name="crps", n_members=4, dropout=0.2)
+        loss = train_sparse_pixel(
+            small_unet(0.2), precip_loader(), epochs=1, loss_config=cfg
+        )
+
+        assert np.isfinite(loss)
+
+    def test_evaluation_reports_spread_and_crps(self):
+        cfg = LossConfig(name="crps", n_members=8, dropout=0.3)
+        metrics = evaluate_sparse_pixel(small_unet(0.3), precip_loader(), cfg)
+
+        assert metrics["spread"] > 0.0
+        assert np.isfinite(metrics["crps"])
+        assert metrics["loss"] == pytest.approx(metrics["crps"], rel=1e-6)
+
+    def test_metrics_are_batch_size_invariant(self):
+        cfg = LossConfig(name="crps", n_members=8, dropout=0.3)
+        model = small_unet(0.3)
+
+        torch.manual_seed(0)
+        a = evaluate_sparse_pixel(model, precip_loader(batch_size=2), cfg)
+        torch.manual_seed(0)
+        b = evaluate_sparse_pixel(model, precip_loader(batch_size=8), cfg)
+
+        assert a["crps"] == pytest.approx(b["crps"], rel=0.1)
+
+    def test_ensemble_mean_drives_rmse(self):
+        cfg = LossConfig(name="crps", n_members=8, dropout=0.3)
+        metrics = evaluate_sparse_pixel(small_unet(0.3), precip_loader(), cfg)
+
+        assert metrics["rmse"] == pytest.approx(np.sqrt(metrics["mse"]), rel=1e-6)
+
+
+class TestTweedieTraining:
+    def test_train_returns_finite_loss(self):
+        cfg = LossConfig(name="tweedie", physical_target=True, tweedie_p=1.5)
+        loss = train_sparse_pixel(
+            small_unet(), precip_loader(), epochs=1, loss_config=cfg
+        )
+
+        assert np.isfinite(loss)
+
+    def test_point_prediction_uses_log_link(self):
+        """RMSE must be computed on exp(eta), not on the raw output."""
+        cfg = LossConfig(name="tweedie", physical_target=True)
+        metrics = evaluate_sparse_pixel(small_unet(), precip_loader(), cfg)
+
+        assert metrics["mse"] >= 0.0
+        assert np.isfinite(metrics["rmse"])
+        assert metrics["spread"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_negative_targets_are_rejected(self):
+        cfg = LossConfig(name="tweedie", physical_target=True)
+        rng = np.random.default_rng(5)
+        loader = make_loader(rng.standard_normal((4, 8, 8)), np.ones((4, 8, 8)), 2)
+
+        with pytest.raises(ValueError, match="non-negative"):
+            evaluate_sparse_pixel(small_unet(), loader, cfg)

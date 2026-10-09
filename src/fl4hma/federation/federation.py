@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
 from fl4hma.models.unet import UNetCNN
+from fl4hma.training.losses import LossConfig
 from fl4hma.training.training import (
     _get_device,
     evaluate_sparse_pixel,
@@ -36,7 +37,9 @@ class AphroFlowerClient(NumPyClient):
         lr: float = 0.001,
         in_channels: int = 3,
         base_filters: int = 32,
+        loss_config: Optional[LossConfig] = None,
     ):
+        self.loss_config = loss_config or LossConfig()
         self.train_loader = DataLoader(
             train_ds,
             batch_size=batch_size,
@@ -49,6 +52,7 @@ class AphroFlowerClient(NumPyClient):
             in_channels=in_channels,
             out_channels=1,
             base_filters=base_filters,
+            dropout=self.loss_config.dropout,
         ).to(self.device)
         self.num_examples = len(train_ds)
 
@@ -63,13 +67,16 @@ class AphroFlowerClient(NumPyClient):
             self.train_loader,
             epochs=self.local_epochs,
             lr=self.lr,
+            loss_config=self.loss_config,
         )
         return get_parameters(self.model), self.num_examples, {"train_loss": loss}
 
     def evaluate(self, parameters, config):
         set_parameters(self.model, parameters)
         self.model.to(self.device)
-        metrics = evaluate_sparse_pixel(self.model, self.train_loader)
+        metrics = evaluate_sparse_pixel(
+            self.model, self.train_loader, loss_config=self.loss_config
+        )
         return metrics["loss"], self.num_examples, {"mse": metrics["mse"]}
 
 
@@ -77,8 +84,20 @@ def get_evaluate_fn(
     test_loader: DataLoader,
     in_channels: int = 3,
     base_filters: int = 32,
+    loss_config: Optional[LossConfig] = None,
 ):
-    """Return a server-side evaluation function for centralised test set."""
+    """Return a server-side evaluation function for the centralised test set.
+
+    Args:
+        test_loader: Loader over the held-out test patches.
+        in_channels: Model input channels.
+        base_filters: Model width.
+        loss_config: Objective selector. Defaults to MSE.
+
+    Returns:
+        A callable with the Flower ``evaluate_fn`` signature.
+    """
+    cfg = loss_config or LossConfig()
 
     def evaluate_fn(
         server_round: int,
@@ -90,15 +109,26 @@ def get_evaluate_fn(
             in_channels=in_channels,
             out_channels=1,
             base_filters=base_filters,
+            dropout=cfg.dropout,
         ).to(device)
         set_parameters(model, parameters)
-        metrics = evaluate_sparse_pixel(model, test_loader)
+        metrics = evaluate_sparse_pixel(model, test_loader, loss_config=cfg)
+        extra = (
+            f", crps={metrics['crps']:.6f}, spread={metrics['spread']:.6f}"
+            if cfg.is_ensemble
+            else ""
+        )
         print(
             f"  [Server] Round {server_round}: "
             f"loss={metrics['loss']:.4f}, mse={metrics['mse']:.6f}, "
-            f"rmse={metrics['rmse']:.6f}"
+            f"rmse={metrics['rmse']:.6f}{extra}"
         )
-        return metrics["loss"], {"mse": metrics["mse"], "rmse": metrics["rmse"]}
+        return metrics["loss"], {
+            "mse": metrics["mse"],
+            "rmse": metrics["rmse"],
+            "crps": metrics["crps"],
+            "spread": metrics["spread"],
+        }
 
     return evaluate_fn
 
@@ -117,11 +147,21 @@ def run_centralised(
     stride: int = 32,
     use_attention: bool = True,
     output_activation: Optional[str] = None,
+    loss_config: Optional[LossConfig] = None,
 ) -> Dict:
     """Train a single model on all data (centralised baseline).
 
-    Returns dict with ``model``, ``train_losses``, ``test_metrics``.
+    Args:
+        loss_config: Objective selector. Defaults to MSE, leaving every
+            pre-existing caller unchanged. Under CRPS the model is built with
+            dropout and scored with the fair ensemble estimator; under Tweedie
+            targets are served in mm.
+
+    Returns:
+        Dict with ``model``, ``train_losses``, ``test_metrics_history`` and
+        ``final_test_metrics``.
     """
+    cfg = loss_config or LossConfig()
     device = _get_device()
 
     train_ds = StationPatchDataset(
@@ -130,6 +170,8 @@ def run_centralised(
         output_mask_path=output_mask_path,
         patch_size=patch_size,
         stride=stride,
+        physical_target=cfg.physical_target,
+        target_min=cfg.target_min,
     )
     test_ds = StationPatchDataset(
         da_test,
@@ -137,6 +179,8 @@ def run_centralised(
         output_mask_path=output_mask_path,
         patch_size=patch_size,
         stride=stride,
+        physical_target=cfg.physical_target,
+        target_min=cfg.target_min,
     )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
@@ -147,6 +191,7 @@ def run_centralised(
         base_filters=base_filters,
         use_attention=use_attention,
         output_activation=output_activation,
+        dropout=cfg.dropout,
     ).to(device)
 
     print("=" * 60)
@@ -155,6 +200,7 @@ def run_centralised(
     print(f"  Train samples : {len(train_ds)}")
     print(f"  Test samples  : {len(test_ds)}")
     print(f"  Epochs        : {num_epochs}")
+    print(f"  Loss          : {cfg.name}")
     print(f"  Device        : {device}")
     print()
 
@@ -162,8 +208,8 @@ def run_centralised(
     test_metrics_history = []
 
     for epoch in range(num_epochs):
-        loss = train_sparse_pixel(model, train_loader, epochs=1, lr=lr)
-        test_met = evaluate_sparse_pixel(model, test_loader)
+        loss = train_sparse_pixel(model, train_loader, epochs=1, lr=lr, loss_config=cfg)
+        test_met = evaluate_sparse_pixel(model, test_loader, loss_config=cfg)
         train_losses.append(loss)
         test_metrics_history.append(test_met)
         print(
@@ -172,9 +218,10 @@ def run_centralised(
             f"test_rmse={test_met['rmse']:.6f}"
         )
 
-    final_test = evaluate_sparse_pixel(model, test_loader)
+    final_test = evaluate_sparse_pixel(model, test_loader, loss_config=cfg)
     print(f"\nFinal centralised test MSE : {final_test['mse']:.6f}")
     print(f"Final centralised test RMSE: {final_test['rmse']:.6f}")
+    print(f"Final centralised test CRPS: {final_test['crps']:.6f}")
 
     return {
         "model": model,
@@ -199,6 +246,7 @@ def run_federated(
     base_filters: int = 32,
     patch_size: int = 32,
     stride: int = 32,
+    loss_config: Optional[LossConfig] = None,
 ) -> Dict:
     """Run Flower FedAvg simulation with per-country clients.
 
@@ -220,11 +268,15 @@ def run_federated(
         Number of FL communication rounds.
     local_epochs : int
         Client-local training epochs per round.
+    loss_config : LossConfig or None
+        Objective selector.  Defaults to MSE, leaving pre-existing callers
+        unchanged.  Applied identically at every client and at the server.
 
     Returns
     -------
     dict with ``model``, ``history``, ``rounds``, ``losses``, ``mse_values``, ``config``.
     """
+    cfg = loss_config or LossConfig()
     np.random.seed(42)
     torch.manual_seed(42)
 
@@ -237,6 +289,7 @@ def run_federated(
     print(f"  Clients       : {num_clients} ({', '.join(country_names)})")
     print(f"  Rounds        : {num_rounds}")
     print(f"  Local epochs  : {local_epochs}")
+    print(f"  Loss          : {cfg.name}")
     print(f"  Device        : {DEVICE}")
     print()
 
@@ -247,6 +300,8 @@ def run_federated(
         output_mask_path,
         patch_size=patch_size,
         stride=stride,
+        physical_target=cfg.physical_target,
+        target_min=cfg.target_min,
     )
     client_list = list(client_datasets.values())
 
@@ -262,6 +317,8 @@ def run_federated(
         output_mask_path=output_mask_path,
         patch_size=patch_size,
         stride=stride,
+        physical_target=cfg.physical_target,
+        target_min=cfg.target_min,
     )
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
@@ -275,6 +332,7 @@ def run_federated(
             lr=lr,
             in_channels=in_channels,
             base_filters=base_filters,
+            loss_config=cfg,
         ).to_client()
 
     # --- Strategy ---
@@ -282,6 +340,7 @@ def run_federated(
         in_channels=in_channels,
         out_channels=1,
         base_filters=base_filters,
+        dropout=cfg.dropout,
     )
     initial_params = fl.common.ndarrays_to_parameters(
         get_parameters(initial_model),
@@ -294,6 +353,7 @@ def run_federated(
         test_loader,
         in_channels=in_channels,
         base_filters=base_filters,
+        loss_config=cfg,
     )
 
     def _capturing_eval(server_round, parameters, config):
@@ -327,6 +387,7 @@ def run_federated(
     losses = [l for _, l in history.losses_centralized]
     mse_values = [m for _, m in history.metrics_centralized.get("mse", [])]
     rmse_values = [m for _, m in history.metrics_centralized.get("rmse", [])]
+    crps_values = [m for _, m in history.metrics_centralized.get("crps", [])]
 
     final_mse = mse_values[-1] if mse_values else 0.0
     final_rmse = rmse_values[-1] if rmse_values else 0.0
@@ -339,6 +400,7 @@ def run_federated(
         in_channels=in_channels,
         out_channels=1,
         base_filters=base_filters,
+        dropout=cfg.dropout,
     ).to(_get_device())
     if _final_params:
         set_parameters(final_model, _final_params)
@@ -351,12 +413,15 @@ def run_federated(
         "losses": losses,
         "mse_values": mse_values,
         "rmse_values": rmse_values,
+        "crps_values": crps_values,
         "final_mse": final_mse,
         "final_rmse": final_rmse,
+        "final_crps": crps_values[-1] if crps_values else float("nan"),
         "config": {
             "num_clients": num_clients,
             "country_names": country_names,
             "num_rounds": num_rounds,
             "local_epochs": local_epochs,
+            "loss": cfg.name,
         },
     }

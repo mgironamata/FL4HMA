@@ -456,3 +456,120 @@ class TestDenormalise:
         expected = da.values[1].astype(np.float32)
         np.testing.assert_allclose(recovered, expected, rtol=1e-4, atol=1e-4)
 
+
+# ── physical-unit target tests ───────────────────────────────────────────────
+
+
+class TestPhysicalTarget:
+    def test_default_target_is_normalised(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(da, input_sparsity=1.0, output_sparsity=1.0)
+
+        _, target, _, _ = ds[0]
+
+        assert not ds.physical_target
+        assert target.min() < 0.0  # z-scores straddle zero
+
+    def test_physical_target_recovers_millimetres(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da, input_sparsity=1.0, output_sparsity=1.0, physical_target=True
+        )
+
+        _, target, _, output_mask = ds[0]
+        t, i, j = ds.indices[0]
+        expected = da.values[0, t, i : i + 32, j : j + 32]
+
+        np.testing.assert_allclose(
+            target[0][output_mask.bool()].numpy(),
+            expected[output_mask.bool().numpy()],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+    def test_input_stays_normalised(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da, input_sparsity=1.0, output_sparsity=1.0, physical_target=True
+        )
+
+        sparse_in, _, _, _ = ds[0]
+
+        assert abs(float(sparse_in[0].mean())) < 3.0  # still z-score scaled
+
+    def test_physical_target_inverts_log_transform(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=1.0,
+            output_sparsity=1.0,
+            log_transform_channel=0,
+            physical_target=True,
+        )
+
+        _, target, _, output_mask = ds[0]
+        t, i, j = ds.indices[0]
+        expected = da.values[0, t, i : i + 32, j : j + 32]
+
+        np.testing.assert_allclose(
+            target[0][output_mask.bool()].numpy(),
+            expected[output_mask.bool().numpy()],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_target_min_clamps_round_trip_negatives(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=1.0,
+            output_sparsity=1.0,
+            physical_target=True,
+            target_min=0.0,
+        )
+
+        _, target, _, output_mask = ds[0]
+
+        assert (target[0][output_mask.bool()] >= 0.0).all()
+
+    def test_target_min_not_applied_by_default(self):
+        """Temperature is legitimately negative, so clamping must be opt-in."""
+        da = make_dataarray()
+        ds = StationPatchDataset(
+            da, input_sparsity=1.0, output_sparsity=1.0, physical_target=True
+        )
+
+        _, target, _, output_mask = ds[0]
+
+        assert (target[0][output_mask.bool()] < 0.0).any()
+
+    def test_sentinel_survives_denormalisation(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da, input_sparsity=1.0, output_sparsity=0.0, physical_target=True
+        )
+
+        _, target, _, output_mask = ds[0]
+
+        assert (target[0][~output_mask.bool()] == -1.0).all()
+
+    def test_no_normalisation_is_identity(self):
+        da = make_precip_dataarray()
+        ds = StationPatchDataset(
+            da,
+            input_sparsity=1.0,
+            output_sparsity=1.0,
+            normalize=False,
+            physical_target=True,
+        )
+
+        _, target, _, output_mask = ds[0]
+        t, i, j = ds.indices[0]
+        expected = da.values[0, t, i : i + 32, j : j + 32]
+
+        np.testing.assert_allclose(
+            target[0][output_mask.bool()].numpy(),
+            expected[output_mask.bool().numpy()],
+            rtol=1e-5,
+            atol=1e-5,
+        )

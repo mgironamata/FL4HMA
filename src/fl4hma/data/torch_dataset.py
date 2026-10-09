@@ -37,6 +37,16 @@ class StationPatchDataset(Dataset):
         Default 1.0 is appropriate for daily precipitation in mm.
     mask_start_year : int
         The first year covered by a 3D yearly mask (default 1998).
+    physical_target : bool
+        Return targets in physical units (mm, degrees) instead of z-scores, by
+        inverting the normalisation and any log transform. Inputs stay
+        normalised either way. Required by the Tweedie loss, which is undefined
+        for the negative values z-scoring produces.
+    target_min : float or None
+        Lower clamp applied to physical targets, absorbing the small negatives
+        the log/z round trip can produce at true zeros. Use ``0.0`` for
+        precipitation; leave ``None`` for temperature, which is legitimately
+        negative.
     """
 
     def __init__(
@@ -53,6 +63,8 @@ class StationPatchDataset(Dataset):
         log_eps: float = 1.0,
         dtype: torch.dtype = torch.float32,
         mask_start_year: int = 1998,
+        physical_target: bool = False,
+        target_min: Optional[float] = None,
     ):
         assert set(dataarray.dims) == {
             "variable",
@@ -68,6 +80,8 @@ class StationPatchDataset(Dataset):
         self.mask_start_year = mask_start_year
         self.log_transform_channel = log_transform_channel
         self.log_eps = log_eps
+        self.physical_target = physical_target
+        self.target_min = target_min
 
         # Convert to numpy
         self.data = dataarray.values.astype(np.float32)
@@ -158,8 +172,13 @@ class StationPatchDataset(Dataset):
         sparse_input = patch.clone()
         sparse_input[0, ~input_mask] = 0.0
 
-        # Sparse target (only labelled pixels; unlabelled = -1)
+        # Sparse target (only labelled pixels; unlabelled = -1).
+        # Denormalise before stamping the sentinel so it is not transformed.
         sparse_target = patch[0].clone().unsqueeze(0)
+        if self.physical_target:
+            sparse_target = self.denormalise(sparse_target, channel=0)
+            if self.target_min is not None:
+                sparse_target = sparse_target.clamp(min=self.target_min)
         sparse_target[0, ~output_mask] = -1.0
 
         return sparse_input, sparse_target, input_mask.float(), output_mask.float()
@@ -212,8 +231,24 @@ def build_country_datasets(
     output_mask_path: str,
     patch_size: int = 32,
     stride: int = 32,
+    physical_target: bool = False,
+    target_min: Optional[float] = None,
 ) -> Dict[str, StationPatchDataset]:
-    """Create one ``StationPatchDataset`` per country."""
+    """Create one ``StationPatchDataset`` per country.
+
+    Args:
+        da: Data array with dims (variable, time, lat, lon).
+        country_masks: ``{country_name: path_to_input_mask.npy}``.
+        output_mask_path: Mask of pixels each client is scored on.
+        patch_size: Spatial patch size.
+        stride: Patch stride.
+        physical_target: Serve targets in physical units (see
+            :class:`StationPatchDataset`).
+        target_min: Lower clamp on physical targets.
+
+    Returns:
+        ``{country_name: dataset}``.
+    """
     datasets = {}
     for country, mask_path in country_masks.items():
         datasets[country] = StationPatchDataset(
@@ -222,5 +257,7 @@ def build_country_datasets(
             output_mask_path=output_mask_path,
             patch_size=patch_size,
             stride=stride,
+            physical_target=physical_target,
+            target_min=target_min,
         )
     return datasets

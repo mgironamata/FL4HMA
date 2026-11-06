@@ -1,9 +1,11 @@
-from typing import Dict, Optional
+import copy
+from contextlib import contextmanager
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 import torch
 import xarray as xr
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 
 class StationPatchDataset(Dataset):
@@ -73,7 +75,9 @@ class StationPatchDataset(Dataset):
             "lon",
         }, "DataArray must have dims ('variable', 'time', 'lat', 'lon')"
 
-        self.da = dataarray
+        years = dataarray.time.dt.year
+        self.start_year = int(years.min().item())
+        self.end_year = int(years.max().item())
         self.patch_size = patch_size
         self.stride = stride
         self.dtype = dtype
@@ -111,9 +115,7 @@ class StationPatchDataset(Dataset):
 
         # Input mask
         if input_mask_path is not None:
-            self.station_mask = np.load(input_mask_path)
-            if self.station_mask.ndim > 2:
-                self.station_mask = self._expand_yearly_to_daily(self.station_mask)
+            self.station_mask = self._load_input_mask(input_mask_path)
         elif input_sparsity is not None:
             self.input_sparsity = input_sparsity
         else:
@@ -201,13 +203,39 @@ class StationPatchDataset(Dataset):
             out = torch.exp(out) - self.log_eps
         return out
 
+    def with_input_mask(self, input_mask_path: str) -> "StationPatchDataset":
+        """Return a dataset that shares this one's data but uses another input mask.
+
+        The normalised data array, patch indices and output mask are shared by
+        reference rather than copied, so many per-client datasets built from
+        the same data cost one array in memory (and in a single pickle).
+
+        Args:
+            input_mask_path: Path to a ``.npy`` 2D (lat, lon) or 3D
+                (year, lat, lon) station mask.
+
+        Returns:
+            A new ``StationPatchDataset`` with ``station_mask`` loaded from
+            ``input_mask_path``.
+        """
+        derived = copy.copy(self)
+        derived.__dict__.pop("input_sparsity", None)
+        derived.station_mask = self._load_input_mask(input_mask_path)
+        return derived
+
+    def _load_input_mask(self, input_mask_path: str) -> np.ndarray:
+        mask = np.load(input_mask_path)
+        if mask.ndim > 2:
+            mask = self._expand_yearly_to_daily(mask)
+        return mask
+
     def _expand_yearly_to_daily(self, yearly_mask: np.ndarray) -> np.ndarray:
         """
         Expand a yearly mask (year, lat, lon) to daily resolution (time, lat, lon),
         sliced to the dataset's time period and accounting for leap years.
         """
-        start_year = self.da.time.dt.year.min().item()
-        end_year = self.da.time.dt.year.max().item()
+        start_year = self.start_year
+        end_year = self.end_year
         yearly_mask = yearly_mask[
             start_year - self.mask_start_year : end_year - self.mask_start_year + 1
         ]
@@ -225,6 +253,50 @@ class StationPatchDataset(Dataset):
         return np.concatenate(daily_mask, axis=0)
 
 
+@contextmanager
+def training_patch_origins(loader: DataLoader) -> Iterator[None]:
+    """Temporarily sample fresh uniform crop origins for one training epoch.
+
+    Time indices and sample counts are preserved. All channels and masks use
+    the same crop through the dataset's existing item extraction. The fixed
+    evaluation grid is restored on exit, including when training raises.
+
+    Args:
+        loader: Training loader. Station datasets, including those wrapped in
+            Subset, receive random origins; other dataset types are unchanged.
+            Persistent worker processes are unsupported because they retain
+            stale copies of the dataset indices.
+
+    Yields:
+        Control while the sampled training indices are active.
+
+    Raises:
+        ValueError: If persistent workers would prevent refreshing origins.
+    """
+    dataset = loader.dataset
+    while isinstance(dataset, Subset):
+        dataset = dataset.dataset
+    if not isinstance(dataset, StationPatchDataset):
+        yield
+        return
+    if loader.persistent_workers:
+        raise ValueError("Random training origins require persistent_workers=False")
+    original = dataset.indices
+    if not original:
+        yield
+        return
+    rows = torch.randint(dataset.lat_len - dataset.patch_size + 1, (len(original),))
+    cols = torch.randint(dataset.lon_len - dataset.patch_size + 1, (len(original),))
+    dataset.indices = [
+        (time, row, col)
+        for (time, _, _), row, col in zip(original, rows.tolist(), cols.tolist())
+    ]
+    try:
+        yield
+    finally:
+        dataset.indices = original
+
+
 def build_country_datasets(
     da: xr.DataArray,
     country_masks: Dict[str, str],
@@ -236,28 +308,36 @@ def build_country_datasets(
 ) -> Dict[str, StationPatchDataset]:
     """Create one ``StationPatchDataset`` per country.
 
+    The data array is normalised once and shared by every country dataset;
+    only the station (input) mask differs between them.
+
     Args:
-        da: Data array with dims (variable, time, lat, lon).
-        country_masks: ``{country_name: path_to_input_mask.npy}``.
-        output_mask_path: Mask of pixels each client is scored on.
-        patch_size: Spatial patch size.
-        stride: Patch stride.
+        da: Data with dims (variable, time, lat, lon).
+        country_masks: ``{country_name: path_to_station_mask.npy}``.
+        output_mask_path: Path to the output (land) mask; the pixels each
+            client is scored on.
+        patch_size: Patch edge length in pixels.
+        stride: Patch stride in pixels.
         physical_target: Serve targets in physical units (see
             :class:`StationPatchDataset`).
         target_min: Lower clamp on physical targets.
 
     Returns:
-        ``{country_name: dataset}``.
+        ``{country_name: dataset}`` in the order of ``country_masks``.
     """
-    datasets = {}
-    for country, mask_path in country_masks.items():
-        datasets[country] = StationPatchDataset(
-            dataarray=da,
-            input_mask_path=mask_path,
-            output_mask_path=output_mask_path,
-            patch_size=patch_size,
-            stride=stride,
-            physical_target=physical_target,
-            target_min=target_min,
-        )
-    return datasets
+    mask_paths = list(country_masks.values())
+    if not mask_paths:
+        return {}
+    base = StationPatchDataset(
+        dataarray=da,
+        input_mask_path=mask_paths[0],
+        output_mask_path=output_mask_path,
+        patch_size=patch_size,
+        stride=stride,
+        physical_target=physical_target,
+        target_min=target_min,
+    )
+    return {
+        country: base if k == 0 else base.with_input_mask(mask_path)
+        for k, (country, mask_path) in enumerate(country_masks.items())
+    }

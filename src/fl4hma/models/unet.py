@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Sequence
 
 import torch
@@ -5,6 +6,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 DROPOUT_BLOCKS = ("enc1", "enc2", "enc3", "bottleneck", "dec3", "dec2", "dec1")
+_NORMS = ("group", "batch")
+
+
+def _make_norm(norm: str, num_channels: int, num_groups: int) -> nn.Module:
+    """Build a normalisation layer.
+
+    Args:
+        norm: ``"group"`` for GroupNorm or ``"batch"`` for BatchNorm2d.
+        num_channels: Number of channels to normalise.
+        num_groups: Target number of GroupNorm groups. The largest common
+            divisor with ``num_channels`` is used so any channel count works.
+
+    Returns:
+        The normalisation module.
+    """
+    if norm == "batch":
+        return nn.BatchNorm2d(num_channels)
+    return nn.GroupNorm(math.gcd(num_groups, num_channels), num_channels)
 
 
 class AttentionGate(nn.Module):
@@ -18,21 +37,30 @@ class AttentionGate(nn.Module):
         F_g: Number of channels in the gating signal (upsampled decoder path).
         F_l: Number of channels in the skip connection (encoder path).
         F_int: Number of intermediate channels for the attention computation.
+        norm: ``"group"`` (default) or ``"batch"``.
+        num_groups: Target number of GroupNorm groups.
     """
 
-    def __init__(self, F_g: int, F_l: int, F_int: int):
+    def __init__(
+        self,
+        F_g: int,
+        F_l: int,
+        F_int: int,
+        norm: str = "group",
+        num_groups: int = 8,
+    ):
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, 1, bias=False),
-            nn.BatchNorm2d(F_int),
+            _make_norm(norm, F_int, num_groups),
         )
         self.W_x = nn.Sequential(
             nn.Conv2d(F_l, F_int, 1, bias=False),
-            nn.BatchNorm2d(F_int),
+            _make_norm(norm, F_int, num_groups),
         )
         self.psi = nn.Sequential(
             nn.Conv2d(F_int, 1, 1, bias=False),
-            nn.BatchNorm2d(1),
+            _make_norm(norm, 1, num_groups),
             nn.Sigmoid(),
         )
 
@@ -65,6 +93,8 @@ class UNetCNN(nn.Module):
         use_attention: bool = True,
         dropout: float = 0.0,
         dropout_blocks: Sequence[str] = ("bottleneck", "dec3", "dec2", "dec1"),
+        norm: str = "group",
+        num_groups: int = 8,
     ):
         """Args:
         output_activation: None (default) for linear output, appropriate when targets
@@ -85,8 +115,17 @@ class UNetCNN(nn.Module):
             to this default raised ensemble spread roughly fourfold at the
             same rate. Adding the encoder blocks spreads further still, at
             the cost of perturbing the finest features.
+        norm: ``"group"`` (default) for GroupNorm, which has no running
+            statistics and treats each sample independently, as
+            per-sample DP-SGD requires. ``"batch"`` restores BatchNorm,
+            e.g. to load checkpoints trained before the switch.
+        num_groups: Target number of GroupNorm groups per layer.
         """
         super(UNetCNN, self).__init__()
+        if norm not in _NORMS:
+            raise ValueError(f"norm must be one of {_NORMS}, got {norm!r}")
+        self.norm = norm
+        self.num_groups = num_groups
         if output_activation not in (None, "relu", "softplus"):
             raise ValueError(
                 f"output_activation must be None, 'relu', or 'softplus', got {output_activation!r}"
@@ -140,23 +179,35 @@ class UNetCNN(nn.Module):
         # Attention gates (one per skip connection, coarsest to finest)
         if use_attention:
             self.att3 = AttentionGate(
-                F_g=base_filters * 4, F_l=base_filters * 4, F_int=base_filters * 2
+                F_g=base_filters * 4,
+                F_l=base_filters * 4,
+                F_int=base_filters * 2,
+                norm=norm,
+                num_groups=num_groups,
             )
             self.att2 = AttentionGate(
-                F_g=base_filters * 2, F_l=base_filters * 2, F_int=base_filters
+                F_g=base_filters * 2,
+                F_l=base_filters * 2,
+                F_int=base_filters,
+                norm=norm,
+                num_groups=num_groups,
             )
             self.att1 = AttentionGate(
-                F_g=base_filters, F_l=base_filters, F_int=max(base_filters // 2, 1)
+                F_g=base_filters,
+                F_l=base_filters,
+                F_int=max(base_filters // 2, 1),
+                norm=norm,
+                num_groups=num_groups,
             )
 
     def _conv_block(self, in_channels: int, out_channels: int) -> nn.Module:
         """Create a convolutional block with two conv layers."""
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            _make_norm(self.norm, out_channels, self.num_groups),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            _make_norm(self.norm, out_channels, self.num_groups),
             nn.ReLU(inplace=True),
         )
 

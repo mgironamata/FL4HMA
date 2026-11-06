@@ -55,7 +55,7 @@ class TestMCDropout:
         assert not torch.allclose(model(batch), model(batch))
 
     def test_batchnorm_stays_in_eval(self):
-        model = build(dropout=0.3)
+        model = build(dropout=0.3, norm="batch")
         enable_mc_dropout(model)
 
         bn = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
@@ -67,7 +67,7 @@ class TestMCDropout:
 
     def test_running_stats_not_updated(self, batch):
         """BatchNorm must not drift while drawing MC samples."""
-        model = build(dropout=0.3)
+        model = build(dropout=0.3, norm="batch")
         enable_mc_dropout(model)
         bn = next(m for m in model.modules() if isinstance(m, nn.BatchNorm2d))
         before = bn.running_mean.clone()
@@ -99,7 +99,8 @@ class TestEnsembleForward:
 
     def test_chunking_preserves_shape_and_distribution(self, batch):
         """Chunking draws masks for differently shaped batches, so the RNG
-        stream differs; only the ensemble distribution is preserved."""
+        stream differs; only the ensemble distribution is preserved. The mean
+        is compared in units of the ensemble std because it sits near zero."""
         model = build(dropout=0.3)
         enable_mc_dropout(model)
 
@@ -109,7 +110,9 @@ class TestEnsembleForward:
         chunked = ensemble_forward(model, batch, n_members=64, chunk_size=8)
 
         assert whole.shape == chunked.shape
-        assert chunked.mean().item() == pytest.approx(whole.mean().item(), rel=1e-2)
+        assert chunked.mean().item() == pytest.approx(
+            whole.mean().item(), abs=0.15 * whole.std().item()
+        )
         assert chunked.std().item() == pytest.approx(whole.std().item(), rel=5e-2)
 
     def test_gradient_flows_through_all_members(self, batch):

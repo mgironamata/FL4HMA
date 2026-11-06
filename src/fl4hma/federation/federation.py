@@ -1,5 +1,6 @@
 """Federated learning client, strategy, and simulation orchestration."""
 
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import flwr as fl
@@ -7,12 +8,11 @@ import numpy as np
 import torch
 import xarray as xr
 from flwr.client import NumPyClient
-from flwr.common import Context
-from flwr.server.strategy import FedAvg
-from flwr.simulation import start_simulation
 from torch.utils.data import DataLoader
 
 from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
+from fl4hma.federation.simulation import run_ray_simulation
+from fl4hma.federation.strategies import AggregationConfig, build_strategy
 from fl4hma.models.unet import UNetCNN
 from fl4hma.training.training import (
     _get_device,
@@ -63,6 +63,7 @@ class AphroFlowerClient(NumPyClient):
             self.train_loader,
             epochs=self.local_epochs,
             lr=self.lr,
+            proximal_mu=float(config.get("proximal_mu", 0.0)),
         )
         return get_parameters(self.model), self.num_examples, {"train_loss": loss}
 
@@ -199,8 +200,9 @@ def run_federated(
     base_filters: int = 32,
     patch_size: int = 32,
     stride: int = 32,
+    aggregation: Optional[AggregationConfig] = None,
 ) -> Dict:
-    """Run Flower FedAvg simulation with per-country clients.
+    """Run Flower simulation with per-country clients.
 
     Parameters
     ----------
@@ -220,11 +222,15 @@ def run_federated(
         Number of FL communication rounds.
     local_epochs : int
         Client-local training epochs per round.
+    aggregation : AggregationConfig or None
+        Server aggregation method (FedAvg, FedProx, FedAdam, FedYogi,
+        FedAdagrad). Defaults to FedAvg.
 
     Returns
     -------
     dict with ``model``, ``history``, ``rounds``, ``losses``, ``mse_values``, ``config``.
     """
+    aggregation = aggregation or AggregationConfig()
     np.random.seed(42)
     torch.manual_seed(42)
 
@@ -237,6 +243,7 @@ def run_federated(
     print(f"  Clients       : {num_clients} ({', '.join(country_names)})")
     print(f"  Rounds        : {num_rounds}")
     print(f"  Local epochs  : {local_epochs}")
+    print(f"  Aggregation   : {aggregation}")
     print(f"  Device        : {DEVICE}")
     print()
 
@@ -266,16 +273,14 @@ def run_federated(
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
     # --- Client factory ---
-    def client_fn(context: Context):
-        cid = int(context.node_config["partition-id"])
-        return AphroFlowerClient(
-            train_ds=client_list[cid],
-            local_epochs=local_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            in_channels=in_channels,
-            base_filters=base_filters,
-        ).to_client()
+    build_client = partial(
+        AphroFlowerClient,
+        local_epochs=local_epochs,
+        batch_size=batch_size,
+        lr=lr,
+        in_channels=in_channels,
+        base_filters=base_filters,
+    )
 
     # --- Strategy ---
     initial_model = UNetCNN(
@@ -301,25 +306,22 @@ def run_federated(
         _final_params.extend(parameters)
         return _inner_eval(server_round, parameters, config)
 
-    strategy = FedAvg(
+    strategy = build_strategy(
+        aggregation,
+        initial_params,
         fraction_fit=1.0,
         fraction_evaluate=0.0,
         min_fit_clients=num_clients,
         min_available_clients=num_clients,
         evaluate_fn=_capturing_eval,
-        initial_parameters=initial_params,
     )
 
     # --- Simulation ---
-    history = start_simulation(
-        client_fn=client_fn,
-        num_clients=num_clients,
-        config=fl.server.ServerConfig(num_rounds=num_rounds),
+    history = run_ray_simulation(
+        client_list,
+        build_client,
+        num_rounds=num_rounds,
         strategy=strategy,
-        client_resources={
-            "num_cpus": 1,
-            "num_gpus": (1.0 / num_clients) if torch.cuda.is_available() else 0.0,
-        },
     )
 
     # --- Collect results ---
@@ -358,5 +360,6 @@ def run_federated(
             "country_names": country_names,
             "num_rounds": num_rounds,
             "local_epochs": local_epochs,
+            "aggregation": aggregation.model_dump(),
         },
     }

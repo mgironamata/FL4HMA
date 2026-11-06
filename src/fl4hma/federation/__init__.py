@@ -16,3 +16,4 @@ from fl4hma.federation.federation import (  # noqa: F401
     run_centralised,
     run_federated,
 )
+from fl4hma.federation.strategies import AggregationConfig, build_strategy  # noqa: F401

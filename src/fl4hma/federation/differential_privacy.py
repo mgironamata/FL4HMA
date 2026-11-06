@@ -35,7 +35,11 @@ from flwr.server.strategy import FedAvg
 from torch.func import functional_call, grad, vmap
 from torch.utils.data import DataLoader
 
-from fl4hma.data.torch_dataset import StationPatchDataset, build_country_datasets
+from fl4hma.data.torch_dataset import (
+    StationPatchDataset,
+    build_country_datasets,
+    training_patch_origins,
+)
 from fl4hma.federation.simulation import run_ray_simulation
 from fl4hma.models.unet import UNetCNN, sparse_pixel_loss
 from fl4hma.training.training import (
@@ -277,6 +281,8 @@ def dp_train_sparse_pixel(
     Each step clips every sample's gradient to ``dp_config.max_grad_norm``,
     sums them, adds N(0, (noise_multiplier × max_grad_norm)²) and divides by
     the batch size, then takes an Adam step on that private gradient.
+    Station datasets draw fresh spatial crop origins each epoch while retaining
+    the same sample count; their fixed evaluation grid is restored afterwards.
 
     Args:
         model: Model to train; must not contain BatchNorm.
@@ -307,24 +313,27 @@ def dp_train_sparse_pixel(
     n_batches = 0
 
     for _ in range(epochs):
-        for sparse_in, sparse_tgt, _, output_mask in loader:
-            sparse_in = sparse_in.to(device)
-            sparse_tgt = sparse_tgt.to(device)
-            output_mask = output_mask.to(device)
+        with training_patch_origins(loader):
+            for sparse_in, sparse_tgt, _, output_mask in loader:
+                sparse_in = sparse_in.to(device)
+                sparse_tgt = sparse_tgt.to(device)
+                output_mask = output_mask.to(device)
 
-            grads, losses, counts = per_sample_gradients(
-                model, sparse_in, sparse_tgt, output_mask
-            )
-            private = privatise_gradients(grads, max_norm, noise_std)
+                grads, losses, counts = per_sample_gradients(
+                    model, sparse_in, sparse_tgt, output_mask
+                )
+                private = privatise_gradients(grads, max_norm, noise_std)
 
-            optimizer.zero_grad()
-            for name, param in model.named_parameters():
-                param.grad = private[name]
-            optimizer.step()
+                optimizer.zero_grad()
+                for name, param in model.named_parameters():
+                    param.grad = private[name]
+                optimizer.step()
 
-            total_loss += ((losses * counts).sum() / counts.sum().clamp_min(1)).item()
-            n_batches += 1
-            accountant.step(dp_config.noise_multiplier, sample_rate)
+                total_loss += (
+                    (losses * counts).sum() / counts.sum().clamp_min(1)
+                ).item()
+                n_batches += 1
+                accountant.step(dp_config.noise_multiplier, sample_rate)
 
     avg_loss = total_loss / max(1, n_batches)
     return avg_loss, accountant

@@ -10,7 +10,7 @@ import torch.optim as optim
 import xarray as xr
 from torch.utils.data import DataLoader
 
-from fl4hma.data.torch_dataset import StationPatchDataset
+from fl4hma.data.torch_dataset import StationPatchDataset, training_patch_origins
 from fl4hma.models.unet import UNetCNN, sparse_pixel_loss
 
 
@@ -35,30 +35,63 @@ def train_sparse_pixel(
     loader: DataLoader,
     epochs: int = 1,
     lr: float = 0.001,
+    proximal_mu: float = 0.0,
 ) -> float:
-    """Train U-Net on sparse pixel data.  Returns average loss."""
+    """Train U-Net on sparse pixel data with fresh crop origins each epoch.
+
+    Station datasets retain their per-day sample budget, but draw uniformly
+    sampled valid spatial origins each epoch. Their fixed evaluation indices
+    are restored afterwards. Other dataset types keep their existing sampling.
+
+    Args:
+        model: Model to train in place.
+        loader: Loader yielding ``(sparse_in, sparse_tgt, input_mask,
+            output_mask)``.
+        epochs: Number of passes over ``loader``.
+        lr: Adam learning rate.
+        proximal_mu: FedProx weight. If > 0, adds
+            ``proximal_mu / 2 * ||w - w_0||^2`` to the loss, where ``w_0`` are
+            the trainable parameters at the start of this call.
+
+    Returns:
+        Mean data loss over batches, excluding the proximal term.
+
+    Raises:
+        ValueError: If ``proximal_mu`` is negative.
+    """
+    if proximal_mu < 0.0:
+        raise ValueError(f"proximal_mu must be >= 0, got {proximal_mu}")
     device = _get_device()
     model.to(device)
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    global_params = [p.detach().clone() for p in trainable]
 
     total_loss = 0.0
     n_batches = 0
 
     for _ in range(epochs):
-        for sparse_in, sparse_tgt, _, output_mask in loader:
-            sparse_in = sparse_in.to(device)
-            sparse_tgt = sparse_tgt.to(device)
-            output_mask = output_mask.to(device)
+        with training_patch_origins(loader):
+            for sparse_in, sparse_tgt, _, output_mask in loader:
+                sparse_in = sparse_in.to(device)
+                sparse_tgt = sparse_tgt.to(device)
+                output_mask = output_mask.to(device)
 
-            optimizer.zero_grad()
-            pred = model(sparse_in)
-            loss = sparse_pixel_loss(pred, sparse_tgt, output_mask)
-            if loss is not None and not torch.isnan(loss):
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                n_batches += 1
+                optimizer.zero_grad()
+                pred = model(sparse_in)
+                loss = sparse_pixel_loss(pred, sparse_tgt, output_mask)
+                if loss is not None and not torch.isnan(loss):
+                    objective = loss
+                    if proximal_mu > 0.0:
+                        objective = loss + (proximal_mu / 2) * sum(
+                            (p - g).pow(2).sum()
+                            for p, g in zip(trainable, global_params)
+                        )
+                    objective.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+                    n_batches += 1
 
     return total_loss / max(1, n_batches)
 

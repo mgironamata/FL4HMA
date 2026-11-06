@@ -1,10 +1,11 @@
 import copy
-from typing import Dict, Optional
+from contextlib import contextmanager
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 import torch
 import xarray as xr
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 
 class StationPatchDataset(Dataset):
@@ -231,6 +232,50 @@ class StationPatchDataset(Dataset):
             )
 
         return np.concatenate(daily_mask, axis=0)
+
+
+@contextmanager
+def training_patch_origins(loader: DataLoader) -> Iterator[None]:
+    """Temporarily sample fresh uniform crop origins for one training epoch.
+
+    Time indices and sample counts are preserved. All channels and masks use
+    the same crop through the dataset's existing item extraction. The fixed
+    evaluation grid is restored on exit, including when training raises.
+
+    Args:
+        loader: Training loader. Station datasets, including those wrapped in
+            Subset, receive random origins; other dataset types are unchanged.
+            Persistent worker processes are unsupported because they retain
+            stale copies of the dataset indices.
+
+    Yields:
+        Control while the sampled training indices are active.
+
+    Raises:
+        ValueError: If persistent workers would prevent refreshing origins.
+    """
+    dataset = loader.dataset
+    while isinstance(dataset, Subset):
+        dataset = dataset.dataset
+    if not isinstance(dataset, StationPatchDataset):
+        yield
+        return
+    if loader.persistent_workers:
+        raise ValueError("Random training origins require persistent_workers=False")
+    original = dataset.indices
+    if not original:
+        yield
+        return
+    rows = torch.randint(dataset.lat_len - dataset.patch_size + 1, (len(original),))
+    cols = torch.randint(dataset.lon_len - dataset.patch_size + 1, (len(original),))
+    dataset.indices = [
+        (time, row, col)
+        for (time, _, _), row, col in zip(original, rows.tolist(), cols.tolist())
+    ]
+    try:
+        yield
+    finally:
+        dataset.indices = original
 
 
 def build_country_datasets(
